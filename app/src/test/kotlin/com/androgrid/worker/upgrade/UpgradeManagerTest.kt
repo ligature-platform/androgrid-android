@@ -2,9 +2,10 @@ package com.androgrid.worker.upgrade
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInfo
 import com.androgrid.v1.NodeUpgradeDirective
+import com.androgrid.v1.UpgradeInstallStatus
 import com.androgrid.v1.UpgradeNetworkPolicy
-import com.androgrid.v1.UpgradeRolloutStrategy
 import com.androgrid.worker.capability.RootChecker
 import com.google.common.truth.Truth.assertThat
 import kotlinx.coroutines.test.runTest
@@ -22,7 +23,8 @@ import java.security.MessageDigest
 /**
  * Hermetic Robolectric unit tests for [UpgradeManager].
  * Validates version thresholds, metered cellular guards ([ANTI-003], [NFR-POW-001]),
- * cryptographic SHA-256 integrity verification ([NFR-SEC-001]), and heterogeneous installation routing.
+ * cryptographic SHA-256 integrity verification ([NFR-SEC-001]), pre-install signing lineage verification,
+ * terminal failure recording, and heterogeneous installation routing.
  *
  * Traces to: [REQ-OP-001], [REQ-OP-002], [INV-001], [INV-002], [INV-003], [ANTI-003], [NFR-POW-001], [NFR-SEC-001]
  */
@@ -42,6 +44,11 @@ class UpgradeManagerTest {
     @Before
     fun setUp() {
         context = RuntimeEnvironment.getApplication()
+        val prefs = context.getSharedPreferences(
+            SharedPreferencesUpgradeLedger.PREFS_NAME,
+            Context.MODE_PRIVATE
+        )
+        prefs.edit().clear().commit()
     }
 
     private fun computeSha256(bytes: ByteArray): String {
@@ -96,7 +103,6 @@ class UpgradeManagerTest {
 
     @Test
     fun testProcessUpgradeDirective_meteredCellularWithWifiOnlyPolicy_returnsNetworkPolicyViolation() = runTest {
-        // Enforces [ANTI-003] & [NFR-POW-001]: APK downloads MUST NOT occur over metered cellular under wifi-only
         val manager = DefaultUpgradeManager(
             context = context,
             rootChecker = FakeRootChecker(rooted = false),
@@ -132,7 +138,9 @@ class UpgradeManagerTest {
             downloadClient = { _, destFile ->
                 destFile.writeBytes(apkPayload)
                 true
-            }
+            },
+            archiveInfoParser = { PackageInfo() },
+            signatureVerifier = { _, _ -> true }
         )
 
         val directive = NodeUpgradeDirective.newBuilder()
@@ -175,7 +183,6 @@ class UpgradeManagerTest {
 
     @Test
     fun testProcessUpgradeDirective_integrityCheck_mismatchedSha256_deletesFileAndFails() = runTest {
-        // Enforces [NFR-SEC-001]: Corrupted APK binaries must be rejected and purged
         val apkPayload = "genuine-apk-content".toByteArray()
         val mismatchedSha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 
@@ -213,6 +220,124 @@ class UpgradeManagerTest {
     }
 
     @Test
+    fun testProcessUpgradeDirective_corruptArchive_nullArchiveInfo_failsAndPurgesFile() = runTest {
+        val apkPayload = "corrupted-unparseable-apk".toByteArray()
+        val payloadSha256 = computeSha256(apkPayload)
+
+        var createdFile: File? = null
+        val manager = DefaultUpgradeManager(
+            context = context,
+            rootChecker = FakeRootChecker(rooted = false),
+            currentVersionProvider = { "0.1.0" },
+            downloadClient = { _, destFile ->
+                destFile.writeBytes(apkPayload)
+                createdFile = destFile
+                true
+            },
+            archiveInfoParser = { null }
+        )
+
+        val directive = NodeUpgradeDirective.newBuilder()
+            .setTargetVersion("0.2.0")
+            .setApkUrl("https://example.com/app.apk")
+            .setApkSha256(payloadSha256)
+            .build()
+
+        val outcome = manager.processUpgradeDirective(
+            directive = directive,
+            isMetered = false,
+            isWifi = true
+        )
+
+        assertThat(outcome).isInstanceOf(UpgradeOutcome.IntegrityVerificationFailed::class.java)
+        val failure = outcome as UpgradeOutcome.IntegrityVerificationFailed
+        assertThat(failure.actualSha256).isEqualTo("CORRUPT_ARCHIVE")
+        assertThat(createdFile?.exists()).isFalse()
+    }
+
+    @Test
+    fun testProcessUpgradeDirective_signingCertificateMismatch_deletesApkAndFails() = runTest {
+        val apkPayload = "untrusted-signed-apk".toByteArray()
+        val payloadSha256 = computeSha256(apkPayload)
+
+        var createdFile: File? = null
+        val manager = DefaultUpgradeManager(
+            context = context,
+            rootChecker = FakeRootChecker(rooted = true),
+            currentVersionProvider = { "0.1.0" },
+            downloadClient = { _, destFile ->
+                destFile.writeBytes(apkPayload)
+                createdFile = destFile
+                true
+            },
+            archiveInfoParser = { PackageInfo() },
+            signatureVerifier = { _, _ -> false }
+        )
+
+        val directive = NodeUpgradeDirective.newBuilder()
+            .setTargetVersion("0.2.0")
+            .setApkUrl("https://example.com/app.apk")
+            .setApkSha256(payloadSha256)
+            .build()
+
+        val outcome = manager.processUpgradeDirective(
+            directive = directive,
+            isMetered = false,
+            isWifi = true
+        )
+
+        assertThat(outcome).isInstanceOf(UpgradeOutcome.SignatureVerificationFailed::class.java)
+        assertThat(createdFile?.exists()).isFalse()
+
+        // Check ledger recorded terminal failure
+        val lastOutcome = manager.getLastOutcome()
+        assertThat(lastOutcome).isNotNull()
+        assertThat(lastOutcome?.status).isEqualTo(UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_TERMINALLY_REJECTED)
+        assertThat(lastOutcome?.errorCode).isEqualTo("SIGNATURE_MISMATCH")
+    }
+
+    @Test
+    fun testProcessUpgradeDirective_terminallyRejected_abortsImmediatelyWithoutDownload() = runTest {
+        val ledger = SharedPreferencesUpgradeLedger(context)
+        val targetVersion = "0.2.0"
+        val apkSha256 = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+
+        ledger.recordTerminalFailure(
+            targetVersion = targetVersion,
+            apkSha256 = apkSha256,
+            errorCode = "INSTALL_FAILED_VERSION_DOWNGRADE",
+            errorMessage = "Downgrade not allowed"
+        )
+
+        var downloadCalled = false
+        val manager = DefaultUpgradeManager(
+            context = context,
+            rootChecker = FakeRootChecker(rooted = false),
+            currentVersionProvider = { "0.1.0" },
+            downloadClient = { _, _ ->
+                downloadCalled = true
+                true
+            },
+            ledger = ledger
+        )
+
+        val directive = NodeUpgradeDirective.newBuilder()
+            .setTargetVersion(targetVersion)
+            .setApkUrl("https://example.com/app.apk")
+            .setApkSha256(apkSha256)
+            .build()
+
+        val outcome = manager.processUpgradeDirective(
+            directive = directive,
+            isMetered = false,
+            isWifi = true
+        )
+
+        assertThat(outcome).isInstanceOf(UpgradeOutcome.TerminallyRejected::class.java)
+        assertThat(downloadCalled).isFalse()
+    }
+
+    @Test
     fun testProcessUpgradeDirective_rootedNode_executesRootInstall() = runTest {
         val apkPayload = "rooted-apk-binary".toByteArray()
         val payloadSha256 = computeSha256(apkPayload)
@@ -228,8 +353,10 @@ class UpgradeManagerTest {
             },
             shellRunner = { cmd ->
                 executedCommand = cmd
-                0
-            }
+                Pair(0, "Success")
+            },
+            archiveInfoParser = { PackageInfo() },
+            signatureVerifier = { _, _ -> true }
         )
 
         val directive = NodeUpgradeDirective.newBuilder()
@@ -262,7 +389,9 @@ class UpgradeManagerTest {
             downloadClient = { _, destFile ->
                 destFile.writeBytes(apkPayload)
                 true
-            }
+            },
+            archiveInfoParser = { PackageInfo() },
+            signatureVerifier = { _, _ -> true }
         )
 
         val directive = NodeUpgradeDirective.newBuilder()

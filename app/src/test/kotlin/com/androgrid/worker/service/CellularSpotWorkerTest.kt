@@ -5,6 +5,7 @@ import androidx.work.ListenableWorker
 import com.androgrid.v1.ClaimCellularTaskRequest
 import com.androgrid.v1.ClaimCellularTaskResponse
 import com.androgrid.v1.ExecutionEngine
+import com.androgrid.v1.LastUpgradeOutcome
 import com.androgrid.v1.NodeUpgradeDirective
 import com.androgrid.v1.SubmitCellularResultRequest
 import com.androgrid.v1.SubmitCellularResultResponse
@@ -158,6 +159,8 @@ class CellularSpotWorkerTest {
             processedDirectives.add(Triple(directive, isMetered, isWifi))
             return outcomeToReturn
         }
+
+        override fun getLastOutcome(): LastUpgradeOutcome? = null
     }
 
     @Test

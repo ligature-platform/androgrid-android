@@ -32,8 +32,10 @@ import com.androgrid.worker.telemetry.DeviceThermalStatusListener
 import com.androgrid.worker.telemetry.SharedPreferencesTaskLedgerRepository
 import com.androgrid.worker.telemetry.TaskLedgerEntry
 import com.androgrid.worker.telemetry.TaskLedgerRepository
+import com.androgrid.v1.NodeUpgradeDirective
 import com.androgrid.worker.telemetry.TaskLedgerStatus
 import com.androgrid.worker.telemetry.ThermalSafetyGuard
+import com.androgrid.worker.upgrade.UpgradeDownloadWorker
 import com.androgrid.worker.upgrade.UpgradeManager
 import io.grpc.ManagedChannel
 import kotlinx.coroutines.NonCancellable
@@ -57,8 +59,18 @@ class CellularSpotWorkerLogic(
     private val thermalListener: DeviceThermalStatusListener? = null,
     private val thermalGuard: ThermalSafetyGuard = ThermalSafetyGuard(),
     private val ledgerRepository: TaskLedgerRepository? = null,
-    private val upgradeManager: UpgradeManager? = null
+    private val upgradeManager: UpgradeManager? = null,
+    private val downloadScheduler: ((NodeUpgradeDirective) -> Unit)? = null
 ) {
+    private suspend fun handleCellularUpgradeDirective(directive: NodeUpgradeDirective) {
+        if (directive.networkPolicy == com.androgrid.v1.UpgradeNetworkPolicy.UPGRADE_NETWORK_POLICY_ALLOW_CELLULAR) {
+            if (downloadScheduler != null) {
+                downloadScheduler.invoke(directive)
+            } else {
+                upgradeManager?.processUpgradeDirective(directive, isMetered = true, isWifi = false)
+            }
+        }
+    }
     /**
      * Executes single spot task cycle: battery & thermal checks -> claim -> execute -> submit.
      * Postpones execution with Result.retry() if battery temperature > 38 C or OS reports thermal throttling.
@@ -116,11 +128,7 @@ class CellularSpotWorkerLogic(
                 return androidx.work.ListenableWorker.Result.success()
             }
             is CellularClaimOutcome.UpgradeAvailable -> {
-                upgradeManager?.processUpgradeDirective(
-                    directive = claimOutcome.directive,
-                    isMetered = true,
-                    isWifi = false
-                )
+                handleCellularUpgradeDirective(claimOutcome.directive)
                 return androidx.work.ListenableWorker.Result.success()
             }
             is CellularClaimOutcome.TransientFailure -> {
@@ -196,11 +204,7 @@ class CellularSpotWorkerLogic(
         // worker returns success to complete WorkManager cycle
         if (submitResult.isSuccess || isStale) {
             if (pendingUpgradeDirective != null) {
-                upgradeManager?.processUpgradeDirective(
-                    directive = pendingUpgradeDirective,
-                    isMetered = true,
-                    isWifi = false
-                )
+                handleCellularUpgradeDirective(pendingUpgradeDirective)
             }
             return androidx.work.ListenableWorker.Result.success()
         } else {
@@ -325,7 +329,10 @@ class CellularSpotWorker(
                 cellularClient = currentClient,
                 thermalListener = thermalListener,
                 ledgerRepository = ledgerRepository,
-                upgradeManager = app?.upgradeManager
+                upgradeManager = app?.upgradeManager,
+                downloadScheduler = { directive ->
+                    UpgradeDownloadWorker.schedule(applicationContext, directive)
+                }
             )
 
             val preClaimed = (renewalOutcome as? RenewalOutcome.Renewed<*>)?.trialResult as? CellularClaimOutcome

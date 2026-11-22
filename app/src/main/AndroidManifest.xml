@@ -88,6 +88,16 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
+        <!-- Deterministic process revival receiver for post-upgrade service restart -->
+        <!-- Traces to: [REQ-OP-001], [REQ-OP-002], [INV-001], [INV-002] -->
+        <receiver
+            android:name="com.androgrid.worker.receiver.PackageReplacedReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

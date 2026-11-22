@@ -259,11 +259,14 @@ class WorkerForegroundService : Service() {
                         )
 
                         // Step 1: Register node per [REQ-OP-001] with exponential backoff retry loop
-                        val regRequest = RegisterNodeRequest.newBuilder()
+                        val regBuilder = RegisterNodeRequest.newBuilder()
                             .setNodeId(nodeId)
                             .setCapabilities(capabilities)
                             .setClientVersion("0.1.0")
-                            .build()
+                        app?.upgradeManager?.getLastOutcome()?.let { outcome ->
+                            regBuilder.setLastUpgradeOutcome(outcome)
+                        }
+                        val regRequest = regBuilder.build()
 
                         var sessionToken = ""
                         var retryDelayMs = SYNC_INTERVAL_MS
@@ -338,11 +341,14 @@ class WorkerForegroundService : Service() {
                                 completedReports.poll()?.let { reportsToSend.add(it) }
                             }
 
-                            val syncRequest = SyncNodeStateRequest.newBuilder()
+                            val syncBuilder = SyncNodeStateRequest.newBuilder()
                                 .setNodeId(nodeId)
                                 .setSessionToken(sessionToken)
                                 .addAllCompletedTasks(reportsToSend)
-                                .build()
+                            app?.upgradeManager?.getLastOutcome()?.let { outcome ->
+                                syncBuilder.setLastUpgradeOutcome(outcome)
+                            }
+                            val syncRequest = syncBuilder.build()
 
                             // Check in-band certificate renewal without dropping session_token or active tasks
                             val currentSettings = settingsRepo.getSettings()
