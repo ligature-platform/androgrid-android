@@ -53,7 +53,25 @@ class UpgradeDownloadWorker(
             is UpgradeOutcome.InstalledRoot,
             is UpgradeOutcome.UpToDate -> Result.success()
             is UpgradeOutcome.PromptUserInstall -> {
-                applicationContext.startActivity(outcome.intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                val pendingIntent = android.app.PendingIntent.getActivity(
+                    applicationContext,
+                    1002,
+                    outcome.intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+                )
+                val notification = androidx.core.app.NotificationCompat.Builder(
+                    applicationContext,
+                    com.androgrid.worker.service.WorkerForegroundService.CHANNEL_ID
+                )
+                    .setContentTitle("AndroGrid Update Ready")
+                    .setContentText("Tap to complete package update to $targetVersion")
+                    .setSmallIcon(com.androgrid.worker.R.drawable.ic_stat_androgrid)
+                    .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+                    .setContentIntent(pendingIntent)
+                    .setAutoCancel(true)
+                    .build()
+                val manager = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
+                manager?.notify(1002, notification)
                 Result.success()
             }
             is UpgradeOutcome.BackoffSuppressed -> Result.retry()

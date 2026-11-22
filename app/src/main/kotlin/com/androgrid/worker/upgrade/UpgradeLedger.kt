@@ -67,6 +67,12 @@ interface UpgradeLedger {
     fun recordPendingUpgrade(targetVersion: String, apkSha256: String)
 
     /**
+     * Records that an upgrade package has been downloaded and verified and is awaiting user confirmation.
+     * Suppresses duplicate re-downloads without escalating to terminal rejection or reporting failure.
+     */
+    fun recordAwaitingUserConfirmation(targetVersion: String, apkSha256: String)
+
+    /**
      * Inspects whether a pending upgrade was performed across process replacement.
      * If currentVersion matches the pending target version, marks the upgrade as SUCCEEDED.
      */
@@ -103,7 +109,8 @@ class SharedPreferencesUpgradeLedger(
             val json = JSONObject(rawJson)
             val status = json.optString("status", "")
             if (status == UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_TERMINALLY_REJECTED.name ||
-                status == UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_SUCCEEDED.name
+                status == UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_SUCCEEDED.name ||
+                status == "AWAITING_USER_CONFIRMATION"
             ) {
                 return -1L
             }
@@ -249,6 +256,24 @@ class SharedPreferencesUpgradeLedger(
 
     override fun clearLastOutcome() = synchronized(lock) {
         prefs.edit().remove(KEY_LAST_OUTCOME).commit()
+        Unit
+    }
+
+    override fun recordAwaitingUserConfirmation(targetVersion: String, apkSha256: String) = synchronized(lock) {
+        val key = buildKey(targetVersion, apkSha256)
+        val existing = readJson(key)
+        val currentAttempts = existing?.optInt("attempt_count", 0) ?: 1
+        val json = JSONObject().apply {
+            put("target_version", targetVersion)
+            put("apk_sha256", apkSha256)
+            put("attempt_count", currentAttempts)
+            put("last_attempt_epoch_ms", timeProvider())
+            put("status", "AWAITING_USER_CONFIRMATION")
+        }
+        prefs.edit()
+            .putString(key, json.toString())
+            .remove(KEY_LAST_OUTCOME)
+            .commit()
         Unit
     }
 

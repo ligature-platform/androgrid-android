@@ -212,4 +212,21 @@ class UpgradeLedgerTest {
         ledger.recordTerminalFailure(version, termSha, "INSTALL_FAILED_VERSION_DOWNGRADE", "Failure")
         assertThat(ledger.getRemainingBackoffMs(version, termSha)).isEqualTo(-1L)
     }
+
+    @Test
+    fun testAwaitingUserConfirmation_suppressesRedownloadsWithoutReportingFailure() {
+        val ledger = SharedPreferencesUpgradeLedger(context)
+        val version = "0.5.0"
+        val sha = "555566667777888899990000aaaabbbbccccddddeeeeffff1111222233334444"
+
+        ledger.recordAttempt(version, sha)
+        ledger.recordAwaitingUserConfirmation(version, sha)
+
+        // shouldAttempt must return false, getRemainingBackoffMs returns -1L
+        assertThat(ledger.shouldAttempt(version, sha)).isFalse()
+        assertThat(ledger.getRemainingBackoffMs(version, sha)).isEqualTo(-1L)
+
+        // Crucially, getLastOutcome must NOT return a failure outcome
+        assertThat(ledger.getLastOutcome()).isNull()
+    }
 }
