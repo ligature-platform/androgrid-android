@@ -3,6 +3,7 @@ package com.androgrid.worker.service
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -75,6 +76,8 @@ class WorkerForegroundService : Service() {
 
     companion object {
         const val NOTIFICATION_ID: Int = 1001
+        const val NOTIFICATION_UPGRADE_ID: Int = 1002
+        const val NOTIFICATION_UPGRADE_REQUEST_CODE: Int = 1002
         const val CHANNEL_ID: String = "androgrid_worker_sync_channel"
 
         const val ACTION_START_SYNC: String = "com.androgrid.worker.action.START_SYNC"
@@ -337,7 +340,7 @@ class WorkerForegroundService : Service() {
                             },
                             upgradeManager = app?.upgradeManager,
                             onPromptUserInstall = { intent ->
-                                startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                                showUpgradePromptNotification(intent)
                             }
                         )
 
@@ -492,6 +495,25 @@ class WorkerForegroundService : Service() {
             .build()
     }
 
+    private fun showUpgradePromptNotification(installIntent: Intent) {
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            NOTIFICATION_UPGRADE_REQUEST_CODE,
+            installIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("AndroGrid Update Ready")
+            .setContentText("Tap to complete package update")
+            .setSmallIcon(R.drawable.ic_stat_androgrid)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        manager?.notify(NOTIFICATION_UPGRADE_ID, notification)
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -525,6 +547,7 @@ internal class WifiSyncTaskProcessor(
     private val onPromptUserInstall: ((Intent) -> Unit)? = null
 ) {
     private val isDrainingForUpgrade = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val isProcessingUpgrade = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
      * Cancels an active in-flight task by [taskId] if present in [activeJobs].
@@ -583,14 +606,20 @@ internal class WifiSyncTaskProcessor(
                 }
             }
         } else if (directive != null) {
-            scope.launch {
-                val outcome = upgradeManager?.processUpgradeDirective(
-                    directive = directive,
-                    isMetered = false,
-                    isWifi = true
-                )
-                if (outcome is UpgradeOutcome.PromptUserInstall) {
-                    onPromptUserInstall?.invoke(outcome.intent)
+            if (isProcessingUpgrade.compareAndSet(false, true)) {
+                scope.launch {
+                    try {
+                        val outcome = upgradeManager?.processUpgradeDirective(
+                            directive = directive,
+                            isMetered = false,
+                            isWifi = true
+                        )
+                        if (outcome is UpgradeOutcome.PromptUserInstall) {
+                            onPromptUserInstall?.invoke(outcome.intent)
+                        }
+                    } finally {
+                        isProcessingUpgrade.set(false)
+                    }
                 }
             }
         }
