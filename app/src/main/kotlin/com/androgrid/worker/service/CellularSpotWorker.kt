@@ -22,6 +22,7 @@ import com.androgrid.worker.enrollment.AndroidKeyStoreEnrollmentProvider
 import com.androgrid.worker.enrollment.CredentialLifecycleManager
 import com.androgrid.worker.enrollment.RenewalOutcome
 import com.androgrid.worker.engine.TaskExecutionDispatcher
+import com.androgrid.worker.engine.WasmComputeEngine
 import com.androgrid.worker.network.ArtifactResolver
 import com.androgrid.worker.network.CellularClaimOutcome
 import com.androgrid.worker.network.CellularTransportClient
@@ -54,7 +55,7 @@ class CellularSpotWorkerLogic(
     private val batteryProvider: BatteryStatusProvider,
     private val capabilityProvider: DeviceCapabilityProvider,
     private val cellularClient: CellularTransportClient = CellularTransportClient(),
-    private val dispatcher: TaskExecutionDispatcher = TaskExecutionDispatcher(),
+    private val dispatcher: TaskExecutionDispatcher = TaskExecutionDispatcher(wasmEngine = WasmComputeEngine(isMeteredProvider = { true })),
     private val channelProvider: (() -> ManagedChannel)? = null,
     private val thermalListener: DeviceThermalStatusListener? = null,
     private val thermalGuard: ThermalSafetyGuard = ThermalSafetyGuard(),
