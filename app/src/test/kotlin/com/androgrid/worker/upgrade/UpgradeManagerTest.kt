@@ -545,4 +545,44 @@ class UpgradeManagerTest {
         val term = outcome as UpgradeOutcome.TerminallyRejected
         assertThat(term.reason).contains("invalid 64-hex SHA-256")
     }
+
+    @Test
+    fun testProcessUpgradeDirective_relativeBlobUrl_resolvesTransportSpecificBaseUrl() = runTest {
+        var requestedUrl = ""
+        val manager = DefaultUpgradeManager(
+            context = context,
+            rootChecker = FakeRootChecker(rooted = true),
+            currentVersionProvider = { "0.1.0" },
+            downloadClient = { url, _ ->
+                requestedUrl = url
+                false
+            },
+            baseUrlProvider = { isWifi ->
+                if (isWifi) "https://192.168.1.100:50051" else "https://cellular.cloud.androgrid.com:50051"
+            }
+        )
+
+        val sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        val directive = NodeUpgradeDirective.newBuilder()
+            .setTargetVersion("0.2.0")
+            .setApkUrl("/v1/blobs/$sha")
+            .setApkSha256(sha)
+            .setNetworkPolicy(UpgradeNetworkPolicy.UPGRADE_NETWORK_POLICY_ALLOW_CELLULAR)
+            .build()
+
+        // Cellular call
+        manager.processUpgradeDirective(directive, isMetered = true, isWifi = false)
+        assertThat(requestedUrl).isEqualTo("https://cellular.cloud.androgrid.com:50051/v1/blobs/$sha")
+
+        // Wi-Fi call with distinct version to avoid backoff suppression
+        val shaWifi = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+        val directiveWifi = NodeUpgradeDirective.newBuilder()
+            .setTargetVersion("0.3.0")
+            .setApkUrl("/v1/blobs/$shaWifi")
+            .setApkSha256(shaWifi)
+            .setNetworkPolicy(UpgradeNetworkPolicy.UPGRADE_NETWORK_POLICY_ALLOW_CELLULAR)
+            .build()
+        manager.processUpgradeDirective(directiveWifi, isMetered = false, isWifi = true)
+        assertThat(requestedUrl).isEqualTo("https://192.168.1.100:50051/v1/blobs/$shaWifi")
+    }
 }

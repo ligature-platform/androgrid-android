@@ -109,10 +109,26 @@ class AndroGridApplication : Application() {
                     )
                 } else null
             },
-            baseUrlProvider = {
+            baseUrlProvider = { isWifi ->
                 val settings = settingsRepository.getSettings()
-                val host = if (settings.wifiHost.isNotBlank()) settings.wifiHost else settings.cellularHost
-                val port = if (settings.wifiPort > 0) settings.wifiPort else settings.cellularPort
+                val host = if (isWifi && settings.wifiHost.isNotBlank()) {
+                    settings.wifiHost
+                } else if (!isWifi && settings.cellularHost.isNotBlank()) {
+                    settings.cellularHost
+                } else if (settings.wifiHost.isNotBlank()) {
+                    settings.wifiHost
+                } else {
+                    settings.cellularHost
+                }
+                val port = if (isWifi && settings.wifiPort > 0) {
+                    settings.wifiPort
+                } else if (!isWifi && settings.cellularPort > 0) {
+                    settings.cellularPort
+                } else if (settings.wifiPort > 0) {
+                    settings.wifiPort
+                } else {
+                    settings.cellularPort
+                }
                 if (host.isNotBlank() && port > 0) {
                     "https://$host:$port"
                 } else null

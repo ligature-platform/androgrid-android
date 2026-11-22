@@ -150,7 +150,7 @@ class DefaultUpgradeManager(
     private val signatureVerifier: ((installed: Array<Signature>?, archive: Array<Signature>?) -> Boolean)? = null,
     private val archiveInfoParser: ((File) -> PackageInfo?)? = null,
     private val mtlsClientProvider: (() -> okhttp3.OkHttpClient?)? = null,
-    private val baseUrlProvider: (() -> String?)? = null
+    private val baseUrlProvider: ((isWifi: Boolean) -> String?)? = null
 ) : UpgradeManager {
 
     init {
@@ -222,7 +222,7 @@ class DefaultUpgradeManager(
             }
 
             val apkUrl = if (rawApkUrl.startsWith("/")) {
-                val base = baseUrlProvider?.invoke()?.trimEnd('/') ?: ""
+                val base = baseUrlProvider?.invoke(isWifi)?.trimEnd('/') ?: ""
                 if (base.isEmpty()) {
                     rawApkUrl
                 } else {
@@ -407,6 +407,8 @@ class DefaultUpgradeManager(
             // Unrooted / Consumer Hardware User Prompt
             val installIntent = createInstallIntent(destFile)
             Log.i(TAG, "Prepared user prompt package installation intent for version $targetVersion")
+            ledger.recordAwaitingUserConfirmation(targetVersion, expectedSha256)
+            ledger.recordPendingUpgrade(targetVersion, expectedSha256)
             UpgradeOutcome.PromptUserInstall(installIntent, destFile)
         }
     }
