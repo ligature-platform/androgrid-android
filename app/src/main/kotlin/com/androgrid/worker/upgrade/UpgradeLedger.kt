@@ -71,6 +71,11 @@ interface UpgradeLedger {
      * If currentVersion matches the pending target version, marks the upgrade as SUCCEEDED.
      */
     fun checkPendingUpgradeOnStartup(currentVersion: String): Boolean
+
+    /**
+     * Returns remaining exponential backoff milliseconds, or -1 if terminally rejected / max attempts exceeded, or 0 if ready.
+     */
+    fun getRemainingBackoffMs(targetVersion: String, apkSha256: String): Long = 0L
 }
 
 /**
@@ -87,9 +92,12 @@ class SharedPreferencesUpgradeLedger(
     )
     private val lock = Any()
 
-    override fun shouldAttempt(targetVersion: String, apkSha256: String): Boolean = synchronized(lock) {
+    override fun shouldAttempt(targetVersion: String, apkSha256: String): Boolean =
+        getRemainingBackoffMs(targetVersion, apkSha256) == 0L
+
+    override fun getRemainingBackoffMs(targetVersion: String, apkSha256: String): Long = synchronized(lock) {
         val key = buildKey(targetVersion, apkSha256)
-        val rawJson = prefs.getString(key, null) ?: return true
+        val rawJson = prefs.getString(key, null) ?: return 0L
 
         return try {
             val json = JSONObject(rawJson)
@@ -97,20 +105,21 @@ class SharedPreferencesUpgradeLedger(
             if (status == UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_TERMINALLY_REJECTED.name ||
                 status == UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_SUCCEEDED.name
             ) {
-                return false
+                return -1L
             }
 
             val attemptCount = json.optInt("attempt_count", 0)
             if (attemptCount >= MAX_TRANSIENT_ATTEMPTS) {
-                return false
+                return -1L
             }
 
             val lastAttemptEpochMs = json.optLong("last_attempt_epoch_ms", 0L)
             val elapsedMs = timeProvider() - lastAttemptEpochMs
             val requiredBackoffMs = computeBackoffMs(attemptCount)
-            elapsedMs >= requiredBackoffMs
+            val remaining = requiredBackoffMs - elapsedMs
+            if (remaining > 0L) remaining else 0L
         } catch (_: Exception) {
-            true
+            0L
         }
     }
 

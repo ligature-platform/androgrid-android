@@ -179,4 +179,37 @@ class UpgradeLedgerTest {
         ledger.clearLastOutcome()
         assertThat(ledger.getLastOutcome()).isNull()
     }
+
+    @Test
+    fun testGetRemainingBackoffMs() {
+        var currentTime = 1_000_000L
+        val ledger = SharedPreferencesUpgradeLedger(context) { currentTime }
+        val version = "0.2.0"
+        val sha = "33334444555566667777888899990000aaaabbbbccccddddeeeeffff11112222"
+
+        // Untried version has 0 remaining backoff
+        assertThat(ledger.getRemainingBackoffMs(version, sha)).isEqualTo(0L)
+
+        // Record a transient failure (first backoff is 60s)
+        ledger.recordAttempt(version, sha)
+        ledger.recordTransientFailure(version, sha, "TIMEOUT", "Download timed out")
+
+        // Should have active positive backoff ms
+        val remaining = ledger.getRemainingBackoffMs(version, sha)
+        assertThat(remaining).isEqualTo(60_000L)
+
+        // Advance 20s
+        currentTime += 20_000L
+        assertThat(ledger.getRemainingBackoffMs(version, sha)).isEqualTo(40_000L)
+
+        // Advance past 60s
+        currentTime += 45_000L
+        assertThat(ledger.getRemainingBackoffMs(version, sha)).isEqualTo(0L)
+
+        // Terminal failure returns -1
+        val termSha = "4444555566667777888899990000aaaabbbbccccddddeeeeffff111122223333"
+        ledger.recordAttempt(version, termSha)
+        ledger.recordTerminalFailure(version, termSha, "INSTALL_FAILED_VERSION_DOWNGRADE", "Failure")
+        assertThat(ledger.getRemainingBackoffMs(version, termSha)).isEqualTo(-1L)
+    }
 }

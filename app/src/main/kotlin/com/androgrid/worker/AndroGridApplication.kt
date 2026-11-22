@@ -108,6 +108,14 @@ class AndroGridApplication : Application() {
                         ephemeralPool = true
                     )
                 } else null
+            },
+            baseUrlProvider = {
+                val settings = settingsRepository.getSettings()
+                val host = if (settings.wifiHost.isNotBlank()) settings.wifiHost else settings.cellularHost
+                val port = if (settings.wifiPort > 0) settings.wifiPort else settings.cellularPort
+                if (host.isNotBlank() && port > 0) {
+                    "https://$host:$port"
+                } else null
             }
         )
     }

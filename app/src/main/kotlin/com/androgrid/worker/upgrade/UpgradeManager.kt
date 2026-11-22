@@ -45,9 +45,14 @@ sealed class UpgradeOutcome {
     data class NetworkPolicyViolation(val reason: String) : UpgradeOutcome()
 
     /**
-     * Directive aborted without network activity because previous attempt terminally failed or is in backoff.
+     * Directive aborted without network activity because previous attempt terminally failed.
      */
     data class TerminallyRejected(val reason: String) : UpgradeOutcome()
+
+    /**
+     * Directive execution is suppressed because exponential backoff delay has not elapsed.
+     */
+    data class BackoffSuppressed(val remainingBackoffMs: Long) : UpgradeOutcome()
 
     /**
      * Binary download failed.
@@ -144,7 +149,8 @@ class DefaultUpgradeManager(
     private val ledger: UpgradeLedger = SharedPreferencesUpgradeLedger(context),
     private val signatureVerifier: ((installed: Array<Signature>?, archive: Array<Signature>?) -> Boolean)? = null,
     private val archiveInfoParser: ((File) -> PackageInfo?)? = null,
-    private val mtlsClientProvider: (() -> okhttp3.OkHttpClient?)? = null
+    private val mtlsClientProvider: (() -> okhttp3.OkHttpClient?)? = null,
+    private val baseUrlProvider: (() -> String?)? = null
 ) : UpgradeManager {
 
     init {
@@ -186,10 +192,15 @@ class DefaultUpgradeManager(
 
             // Step 2: Loop Termination Check via UpgradeLedger
             val expectedSha256 = directive.apkSha256.trim().lowercase()
-            if (!ledger.shouldAttempt(targetVersion, expectedSha256)) {
-                val reason = "Directive for version $targetVersion (sha=$expectedSha256) is terminally rejected or currently suppressed by exponential backoff"
+            val remainingBackoffMs = ledger.getRemainingBackoffMs(targetVersion, expectedSha256)
+            if (remainingBackoffMs < 0L) {
+                val reason = "Directive for version $targetVersion (sha=$expectedSha256) is terminally rejected or exceeded max attempts"
                 Log.w(TAG, reason)
                 return@withContext UpgradeOutcome.TerminallyRejected(reason)
+            } else if (remainingBackoffMs > 0L) {
+                val reason = "Directive for version $targetVersion (sha=$expectedSha256) suppressed by backoff ($remainingBackoffMs ms remaining)"
+                Log.i(TAG, reason)
+                return@withContext UpgradeOutcome.BackoffSuppressed(remainingBackoffMs)
             }
 
             // Step 3: Network Guard Enforcement per [ANTI-003], [NFR-POW-001]
@@ -201,13 +212,24 @@ class DefaultUpgradeManager(
                 return@withContext UpgradeOutcome.NetworkPolicyViolation(reason)
             }
 
-            // Step 4: APK URL validation
-            val apkUrl = directive.apkUrl.trim()
-            if (apkUrl.isEmpty()) {
+            // Step 4: APK URL validation and relative path resolution
+            val rawApkUrl = directive.apkUrl.trim()
+            if (rawApkUrl.isEmpty()) {
                 val err = "OTA APK download rejected: missing or empty apk_url in directive"
                 Log.e(TAG, err)
                 ledger.recordTransientFailure(targetVersion, expectedSha256, "EMPTY_URL", err)
                 return@withContext UpgradeOutcome.DownloadFailed(err)
+            }
+
+            val apkUrl = if (rawApkUrl.startsWith("/")) {
+                val base = baseUrlProvider?.invoke()?.trimEnd('/') ?: ""
+                if (base.isEmpty()) {
+                    rawApkUrl
+                } else {
+                    "$base$rawApkUrl"
+                }
+            } else {
+                rawApkUrl
             }
 
             // Step 5: Cryptographic SHA-256 Format Verification per [NFR-SEC-001]
@@ -433,11 +455,13 @@ class DefaultUpgradeManager(
         if (destFile.exists()) {
             destFile.delete()
         }
-        val client = mtlsClientProvider?.invoke() ?: OkHttpClient.Builder()
+        val baseClient = mtlsClientProvider?.invoke() ?: OkHttpClient()
+        val client = baseClient.newBuilder()
             .followRedirects(false)
             .followSslRedirects(false)
             .connectTimeout(CONNECT_TIMEOUT_MS.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
             .readTimeout(READ_TIMEOUT_MS.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
+            .callTimeout(10, java.util.concurrent.TimeUnit.MINUTES)
             .build()
 
         val request = Request.Builder().url(sourceUrl).get().build()
@@ -501,16 +525,19 @@ class DefaultUpgradeManager(
                     process.inputStream.bufferedReader().use { it.readText() }
                 }
 
-                // Stream APK bytes via stdin to bypass SELinux app_data_file path access restrictions
-                apkFile.inputStream().use { input ->
-                    process.outputStream.use { output ->
-                        input.copyTo(output)
-                        output.flush()
+                // Stream APK bytes via stdin concurrently to avoid blocking timeout if su hangs
+                val stdinDeferred = async(Dispatchers.IO) {
+                    apkFile.inputStream().use { input ->
+                        process.outputStream.use { output ->
+                            input.copyTo(output)
+                            output.flush()
+                        }
                     }
                 }
 
-                // Wait with 120-second timeout
+                // Wait with 120-second timeout protecting both stdin streaming and output reading
                 val finished = withTimeoutOrNull(120_000L) {
+                    stdinDeferred.await()
                     val out = outputDeferred.await()
                     val exit = process.waitFor()
                     Pair(exit, out.trim())
