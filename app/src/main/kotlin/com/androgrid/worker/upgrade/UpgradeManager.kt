@@ -16,13 +16,15 @@ import com.androgrid.v1.UpgradeNetworkPolicy
 import com.androgrid.worker.capability.RootChecker
 import com.androgrid.worker.capability.StandardRootChecker
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
 import java.security.MessageDigest
 
 /**
@@ -141,7 +143,8 @@ class DefaultUpgradeManager(
     private val shellRunner: (suspend (command: String) -> Pair<Int, String>)? = null,
     private val ledger: UpgradeLedger = SharedPreferencesUpgradeLedger(context),
     private val signatureVerifier: ((installed: Array<Signature>?, archive: Array<Signature>?) -> Boolean)? = null,
-    private val archiveInfoParser: ((File) -> PackageInfo?)? = null
+    private val archiveInfoParser: ((File) -> PackageInfo?)? = null,
+    private val mtlsClientProvider: (() -> okhttp3.OkHttpClient?)? = null
 ) : UpgradeManager {
 
     init {
@@ -430,20 +433,34 @@ class DefaultUpgradeManager(
         if (destFile.exists()) {
             destFile.delete()
         }
-        val url = URL(sourceUrl)
-        val connection = url.openConnection() as HttpURLConnection
-        connection.connectTimeout = CONNECT_TIMEOUT_MS
-        connection.readTimeout = READ_TIMEOUT_MS
-        connection.instanceFollowRedirects = true
+        val client = mtlsClientProvider?.invoke() ?: OkHttpClient.Builder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .connectTimeout(CONNECT_TIMEOUT_MS.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
+            .readTimeout(READ_TIMEOUT_MS.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
+            .build()
 
-        connection.inputStream.use { input ->
-            FileOutputStream(destFile).use { output ->
-                val buffer = ByteArray(BUFFER_SIZE)
-                var bytesRead: Int
-                while (input.read(buffer).also { bytesRead = it } != -1) {
-                    output.write(buffer, 0, bytesRead)
+        val request = Request.Builder().url(sourceUrl).get().build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw java.io.IOException("HTTP ${response.code} downloading OTA APK from $sourceUrl")
+            }
+            val body = response.body ?: throw java.io.IOException("Empty HTTP body from $sourceUrl")
+            val maxBytes = 100L * 1024L * 1024L // 100 MB ceiling
+            var totalRead = 0L
+            body.byteStream().use { input ->
+                FileOutputStream(destFile).use { output ->
+                    val buffer = ByteArray(BUFFER_SIZE)
+                    var bytesRead: Int
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        totalRead += bytesRead
+                        if (totalRead > maxBytes) {
+                            throw java.io.IOException("Downloaded APK exceeded maximum size limit of 100 MB ($totalRead bytes)")
+                        }
+                        output.write(buffer, 0, bytesRead)
+                    }
+                    output.flush()
                 }
-                output.flush()
             }
         }
         return destFile.exists() && destFile.length() > 0L
@@ -475,7 +492,15 @@ class DefaultUpgradeManager(
         return withContext(Dispatchers.IO) {
             try {
                 ledger.recordPendingUpgrade(targetVersion, expectedSha256)
-                val process = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+                val pb = ProcessBuilder("su", "-c", cmd)
+                pb.redirectErrorStream(true)
+                val process = pb.start()
+
+                // Concurrently read stdout/stderr to prevent OS pipe buffer deadlocks
+                val outputDeferred = async(Dispatchers.IO) {
+                    process.inputStream.bufferedReader().use { it.readText() }
+                }
+
                 // Stream APK bytes via stdin to bypass SELinux app_data_file path access restrictions
                 apkFile.inputStream().use { input ->
                     process.outputStream.use { output ->
@@ -483,10 +508,27 @@ class DefaultUpgradeManager(
                         output.flush()
                     }
                 }
-                val output = process.inputStream.bufferedReader().use { it.readText() } +
-                    process.errorStream.bufferedReader().use { it.readText() }
-                val exitCode = process.waitFor()
-                Pair(exitCode, output.trim())
+
+                // Wait with 120-second timeout
+                val finished = withTimeoutOrNull(120_000L) {
+                    val out = outputDeferred.await()
+                    val exit = process.waitFor()
+                    Pair(exit, out.trim())
+                }
+
+                if (finished == null) {
+                    process.destroyForcibly()
+                    Log.e(TAG, "Root install timed out after 120 seconds")
+                    Pair(-1, "Installation timed out after 120s")
+                } else {
+                    val (exitCode, output) = finished
+                    val isSuccess = exitCode == 0 && output.contains("Success") && !output.contains("Failure")
+                    if (isSuccess) {
+                        Pair(0, output)
+                    } else {
+                        Pair(if (exitCode == 0) -1 else exitCode, output)
+                    }
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to execute su root shell command: ${e.message}", e)
                 Pair(-1, e.message ?: "Process execution failed")

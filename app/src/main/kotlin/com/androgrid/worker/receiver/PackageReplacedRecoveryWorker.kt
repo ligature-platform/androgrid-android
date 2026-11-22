@@ -34,6 +34,26 @@ class PackageReplacedRecoveryWorker(
         }
     }
 
+    override suspend fun getForegroundInfo(): androidx.work.ForegroundInfo {
+        val notificationManager = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        val channelId = "androgrid_recovery_channel"
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            val channel = android.app.NotificationChannel(
+                channelId,
+                "Package Replacement Recovery",
+                android.app.NotificationManager.IMPORTANCE_LOW
+            )
+            notificationManager.createNotificationChannel(channel)
+        }
+        val notification = androidx.core.app.NotificationCompat.Builder(applicationContext, channelId)
+            .setContentTitle("AndroGrid Recovery")
+            .setContentText("Restoring worker service...")
+            .setSmallIcon(com.androgrid.worker.R.drawable.ic_stat_androgrid)
+            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_LOW)
+            .build()
+        return androidx.work.ForegroundInfo(9999, notification)
+    }
+
     companion object {
         private const val TAG = "PackageReplacedRecovery"
     }

@@ -112,4 +112,12 @@ class PackageReplacedReceiverTest {
         assertThat(nextServiceIntent.component?.className).isEqualTo(WorkerForegroundService::class.java.name)
         assertThat(nextServiceIntent.action).isEqualTo(WorkerForegroundService.ACTION_START_SYNC)
     }
+
+    @Test
+    fun testPackageReplacedRecoveryWorker_getForegroundInfo() = runBlocking {
+        val worker = TestListenableWorkerBuilder<PackageReplacedRecoveryWorker>(context).build()
+        val foregroundInfo = worker.getForegroundInfo()
+        assertThat(foregroundInfo.notificationId).isEqualTo(9999)
+        assertThat(foregroundInfo.notification).isNotNull()
+    }
 }

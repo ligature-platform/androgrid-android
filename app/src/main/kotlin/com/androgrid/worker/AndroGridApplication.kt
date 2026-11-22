@@ -92,7 +92,24 @@ class AndroGridApplication : Application() {
     }
 
     val upgradeManager: com.androgrid.worker.upgrade.UpgradeManager by lazy {
-        com.androgrid.worker.upgrade.DefaultUpgradeManager(this)
+        com.androgrid.worker.upgrade.DefaultUpgradeManager(
+            context = this,
+            mtlsClientProvider = {
+                val settings = settingsRepository.getSettings()
+                if (settings.hasMtlsCredentials) {
+                    val activeAlias = settings.clientKeyPem.removePrefix("keystore:")
+                        .takeIf { settings.clientKeyPem.startsWith("keystore:") }
+                        ?: com.androgrid.worker.enrollment.AndroidKeyStoreEnrollmentProvider.DEFAULT_ENROLLMENT_ALIAS
+                    val mtlsContext = credentialLifecycleManager.createCandidateMtlsContext(activeAlias, settings.caCertPem)
+                    val authority = if (com.androgrid.worker.network.OkHttpBlobFetcher.isLoopbackHost(settings.wifiHost)) "localhost" else null
+                    com.androgrid.worker.network.OkHttpBlobFetcher.buildMtlsClient(
+                        mtlsContext = mtlsContext,
+                        allowLocalhostLoopback = authority != null,
+                        ephemeralPool = true
+                    )
+                } else null
+            }
+        )
     }
 
     override fun onTrimMemory(level: Int) {
