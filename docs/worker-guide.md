@@ -199,3 +199,26 @@ Once started:
      nodes
    ```
 4. Your Android device will appear in the active worker node inventory!
+
+---
+
+## Step 6: Over-the-Air (OTA) Node Upgrades & Unattended Root Stdin Streaming
+
+When deployed as an unattended or rooted node, the worker supports zero-touch Over-the-Air (OTA) upgrades driven by orchestrator directives:
+
+### 1. Root Stdin Streaming Architecture (`pm install -r -S`)
+Modern Android platform security forbids `system_server` from reading application-private directories (`neverallow system_server app_data_file:file read`).
+The worker executes upgrades by streaming the downloaded APK payload directly into the standard input of the package manager:
+```bash
+su -c "pm install -r -S <byteSize>" < <privateApkStream>
+```
+This eliminates world-readable filesystem staging risks and guarantees atomic installation across modern Android versions (API 34-36+).
+
+### 2. Headless Service Revival & Battery Exemption
+- **Post-Install Broadcast:** Upon installation, Android sends `android.intent.action.MY_PACKAGE_REPLACED`. `PackageReplacedReceiver` automatically restarts `WorkerForegroundService` in headless mode.
+- **WorkManager Recovery Fallback:** If aggressive OEM battery managers block direct foreground service startup from background receivers, `PackageReplacedRecoveryWorker` bootstraps service revival via Jetpack WorkManager.
+- **Battery Optimization:** Ensure the app is exempted from battery optimizations (Step 4) so background OTA installations and revivals proceed without OS suppression.
+
+### 3. Signing Lineage & Rollback Protection
+- **Pre-Install Signature Verification:** APK signatures are checked against the installed certificate lineage before initiating root shell commands. Mismatched or corrupted APKs are rejected immediately.
+- **Anti-Rollback Enforcement:** Production builds strictly omit the `-d` downgrade flag, enforcing monotonic platform version increments.
