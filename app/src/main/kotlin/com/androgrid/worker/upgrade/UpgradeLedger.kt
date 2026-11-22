@@ -55,6 +55,22 @@ interface UpgradeLedger {
      * Returns the structured outcome of the most recent upgrade attempt to report to the orchestrator.
      */
     fun getLastOutcome(): LastUpgradeOutcome?
+
+    /**
+     * Clears the cached last outcome once acknowledged by the control plane.
+     */
+    fun clearLastOutcome()
+
+    /**
+     * Stashes a pending upgrade directive before privileged package manager execution.
+     */
+    fun recordPendingUpgrade(targetVersion: String, apkSha256: String)
+
+    /**
+     * Inspects whether a pending upgrade was performed across process replacement.
+     * If currentVersion matches the pending target version, marks the upgrade as SUCCEEDED.
+     */
+    fun checkPendingUpgradeOnStartup(currentVersion: String): Boolean
 }
 
 /**
@@ -69,8 +85,9 @@ class SharedPreferencesUpgradeLedger(
         PREFS_NAME,
         Context.MODE_PRIVATE
     )
+    private val lock = Any()
 
-    override fun shouldAttempt(targetVersion: String, apkSha256: String): Boolean {
+    override fun shouldAttempt(targetVersion: String, apkSha256: String): Boolean = synchronized(lock) {
         val key = buildKey(targetVersion, apkSha256)
         val rawJson = prefs.getString(key, null) ?: return true
 
@@ -98,36 +115,40 @@ class SharedPreferencesUpgradeLedger(
     }
 
     override fun recordAttempt(targetVersion: String, apkSha256: String) {
-        val key = buildKey(targetVersion, apkSha256)
-        val existing = readJson(key)
-        val currentAttempts = existing?.optInt("attempt_count", 0) ?: 0
-        val json = JSONObject().apply {
-            put("target_version", targetVersion)
-            put("apk_sha256", apkSha256)
-            put("attempt_count", currentAttempts + 1)
-            put("last_attempt_epoch_ms", timeProvider())
-            put("status", UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_FAILED_TRANSIENT.name)
+        synchronized(lock) {
+            val key = buildKey(targetVersion, apkSha256)
+            val existing = readJson(key)
+            val currentAttempts = existing?.optInt("attempt_count", 0) ?: 0
+            val json = JSONObject().apply {
+                put("target_version", targetVersion)
+                put("apk_sha256", apkSha256)
+                put("attempt_count", currentAttempts + 1)
+                put("last_attempt_epoch_ms", timeProvider())
+                put("status", UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_FAILED_TRANSIENT.name)
+            }
+            prefs.edit().putString(key, json.toString()).commit()
         }
-        prefs.edit().putString(key, json.toString()).commit()
     }
 
     override fun recordSuccess(targetVersion: String, apkSha256: String) {
-        val key = buildKey(targetVersion, apkSha256)
-        val existing = readJson(key)
-        val attempts = existing?.optInt("attempt_count", 1) ?: 1
-        val json = JSONObject().apply {
-            put("target_version", targetVersion)
-            put("apk_sha256", apkSha256)
-            put("attempt_count", attempts)
-            put("last_attempt_epoch_ms", timeProvider())
-            put("status", UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_SUCCEEDED.name)
-            put("error_code", "")
-            put("error_message", "")
+        synchronized(lock) {
+            val key = buildKey(targetVersion, apkSha256)
+            val existing = readJson(key)
+            val attempts = existing?.optInt("attempt_count", 1) ?: 1
+            val json = JSONObject().apply {
+                put("target_version", targetVersion)
+                put("apk_sha256", apkSha256)
+                put("attempt_count", attempts)
+                put("last_attempt_epoch_ms", timeProvider())
+                put("status", UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_SUCCEEDED.name)
+                put("error_code", "")
+                put("error_message", "")
+            }
+            prefs.edit()
+                .putString(key, json.toString())
+                .putString(KEY_LAST_OUTCOME, json.toString())
+                .commit()
         }
-        prefs.edit()
-            .putString(key, json.toString())
-            .putString(KEY_LAST_OUTCOME, json.toString())
-            .commit()
     }
 
     override fun recordTerminalFailure(
@@ -136,22 +157,24 @@ class SharedPreferencesUpgradeLedger(
         errorCode: String,
         errorMessage: String
     ) {
-        val key = buildKey(targetVersion, apkSha256)
-        val existing = readJson(key)
-        val attempts = existing?.optInt("attempt_count", 1) ?: 1
-        val json = JSONObject().apply {
-            put("target_version", targetVersion)
-            put("apk_sha256", apkSha256)
-            put("attempt_count", attempts)
-            put("last_attempt_epoch_ms", timeProvider())
-            put("status", UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_TERMINALLY_REJECTED.name)
-            put("error_code", errorCode)
-            put("error_message", errorMessage)
+        synchronized(lock) {
+            val key = buildKey(targetVersion, apkSha256)
+            val existing = readJson(key)
+            val attempts = existing?.optInt("attempt_count", 1) ?: 1
+            val json = JSONObject().apply {
+                put("target_version", targetVersion)
+                put("apk_sha256", apkSha256)
+                put("attempt_count", attempts)
+                put("last_attempt_epoch_ms", timeProvider())
+                put("status", UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_TERMINALLY_REJECTED.name)
+                put("error_code", errorCode)
+                put("error_message", errorMessage)
+            }
+            prefs.edit()
+                .putString(key, json.toString())
+                .putString(KEY_LAST_OUTCOME, json.toString())
+                .commit()
         }
-        prefs.edit()
-            .putString(key, json.toString())
-            .putString(KEY_LAST_OUTCOME, json.toString())
-            .commit()
     }
 
     override fun recordTransientFailure(
@@ -160,32 +183,34 @@ class SharedPreferencesUpgradeLedger(
         errorCode: String,
         errorMessage: String
     ) {
-        val key = buildKey(targetVersion, apkSha256)
-        val existing = readJson(key)
-        val attempts = existing?.optInt("attempt_count", 1) ?: 1
-        val isTerminal = attempts >= MAX_TRANSIENT_ATTEMPTS
-        val status = if (isTerminal) {
-            UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_TERMINALLY_REJECTED
-        } else {
-            UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_FAILED_TRANSIENT
-        }
+        synchronized(lock) {
+            val key = buildKey(targetVersion, apkSha256)
+            val existing = readJson(key)
+            val attempts = existing?.optInt("attempt_count", 1) ?: 1
+            val isTerminal = attempts >= MAX_TRANSIENT_ATTEMPTS
+            val status = if (isTerminal) {
+                UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_TERMINALLY_REJECTED
+            } else {
+                UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_FAILED_TRANSIENT
+            }
 
-        val json = JSONObject().apply {
-            put("target_version", targetVersion)
-            put("apk_sha256", apkSha256)
-            put("attempt_count", attempts)
-            put("last_attempt_epoch_ms", timeProvider())
-            put("status", status.name)
-            put("error_code", errorCode)
-            put("error_message", errorMessage)
+            val json = JSONObject().apply {
+                put("target_version", targetVersion)
+                put("apk_sha256", apkSha256)
+                put("attempt_count", attempts)
+                put("last_attempt_epoch_ms", timeProvider())
+                put("status", status.name)
+                put("error_code", errorCode)
+                put("error_message", errorMessage)
+            }
+            prefs.edit()
+                .putString(key, json.toString())
+                .putString(KEY_LAST_OUTCOME, json.toString())
+                .commit()
         }
-        prefs.edit()
-            .putString(key, json.toString())
-            .putString(KEY_LAST_OUTCOME, json.toString())
-            .commit()
     }
 
-    override fun getLastOutcome(): LastUpgradeOutcome? {
+    override fun getLastOutcome(): LastUpgradeOutcome? = synchronized(lock) {
         val rawJson = prefs.getString(KEY_LAST_OUTCOME, null) ?: return null
         return try {
             val json = JSONObject(rawJson)
@@ -213,6 +238,33 @@ class SharedPreferencesUpgradeLedger(
         }
     }
 
+    override fun clearLastOutcome() = synchronized(lock) {
+        prefs.edit().remove(KEY_LAST_OUTCOME).commit()
+        Unit
+    }
+
+    override fun recordPendingUpgrade(targetVersion: String, apkSha256: String) = synchronized(lock) {
+        prefs.edit()
+            .putString(KEY_PENDING_TARGET_VERSION, targetVersion)
+            .putString(KEY_PENDING_APK_SHA256, apkSha256)
+            .commit()
+        Unit
+    }
+
+    override fun checkPendingUpgradeOnStartup(currentVersion: String): Boolean = synchronized(lock) {
+        val pendingTarget = prefs.getString(KEY_PENDING_TARGET_VERSION, null) ?: return false
+        val pendingSha = prefs.getString(KEY_PENDING_APK_SHA256, "") ?: ""
+        if (pendingTarget.isNotEmpty() && currentVersion.trim() == pendingTarget.trim()) {
+            recordSuccess(pendingTarget, pendingSha)
+            prefs.edit()
+                .remove(KEY_PENDING_TARGET_VERSION)
+                .remove(KEY_PENDING_APK_SHA256)
+                .commit()
+            return true
+        }
+        return false
+    }
+
     private fun readJson(key: String): JSONObject? {
         val raw = prefs.getString(key, null) ?: return null
         return try {
@@ -237,6 +289,8 @@ class SharedPreferencesUpgradeLedger(
     companion object {
         const val PREFS_NAME = "androgrid_upgrade_ledger"
         const val KEY_LAST_OUTCOME = "last_upgrade_outcome"
+        const val KEY_PENDING_TARGET_VERSION = "pending_target_version"
+        const val KEY_PENDING_APK_SHA256 = "pending_apk_sha256"
         const val MAX_TRANSIENT_ATTEMPTS = 3
 
         /**

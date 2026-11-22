@@ -28,6 +28,16 @@ class PackageReplacedReceiver : BroadcastReceiver() {
             return
         }
 
+        // Reconcile pending upgrade outcome across process replacement
+        val upgradeLedger = com.androgrid.worker.upgrade.SharedPreferencesUpgradeLedger(context)
+        val currentVersion = try {
+            val pkgInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            pkgInfo.versionName ?: "0.0.1-alpha.4"
+        } catch (_: Exception) {
+            "0.0.1-alpha.4"
+        }
+        upgradeLedger.checkPendingUpgradeOnStartup(currentVersion)
+
         val settingsRepo = SharedPreferencesClusterSettingsRepository.getInstance(context)
         val settings = settingsRepo.getSettings()
         val prefs = context.getSharedPreferences(

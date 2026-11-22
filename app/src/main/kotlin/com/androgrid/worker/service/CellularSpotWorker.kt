@@ -106,14 +106,20 @@ class CellularSpotWorkerLogic(
                 thermalStatus = thermalStatus
             )
 
-            val claimRequest = ClaimCellularTaskRequest.newBuilder()
+            val clientVersion = upgradeManager?.currentVersion ?: "0.0.1-alpha.4"
+
+            val claimRequestBuilder = ClaimCellularTaskRequest.newBuilder()
                 .setNodeId(nodeId)
                 .setCapabilities(capabilities)
                 .setBatteryLevelPct(battery.levelPercent)
                 .setIsCharging(battery.isCharging)
                 .setBatteryTemperatureCelsius(battery.temperatureCelsius)
                 .setThermalStatus(thermalStatus)
-                .build()
+                .setClientVersion(clientVersion)
+            upgradeManager?.getLastOutcome()?.let { outcome ->
+                claimRequestBuilder.setLastUpgradeOutcome(outcome)
+            }
+            val claimRequest = claimRequestBuilder.build()
 
             if (channelProvider != null) {
                 val channel = channelProvider.invoke()
@@ -125,9 +131,11 @@ class CellularSpotWorkerLogic(
 
         val (task, pendingUpgradeDirective) = when (claimOutcome) {
             is CellularClaimOutcome.NoTask -> {
+                upgradeManager?.clearLastOutcome()
                 return androidx.work.ListenableWorker.Result.success()
             }
             is CellularClaimOutcome.UpgradeAvailable -> {
+                upgradeManager?.clearLastOutcome()
                 handleCellularUpgradeDirective(claimOutcome.directive)
                 return androidx.work.ListenableWorker.Result.success()
             }
@@ -158,7 +166,10 @@ class CellularSpotWorkerLogic(
                 }
                 return androidx.work.ListenableWorker.Result.success()
             }
-            is CellularClaimOutcome.TaskReady -> Pair(claimOutcome.task, claimOutcome.upgradeDirective)
+            is CellularClaimOutcome.TaskReady -> {
+                upgradeManager?.clearLastOutcome()
+                Pair(claimOutcome.task, claimOutcome.upgradeDirective)
+            }
         }
 
         // Step 5: Offline compute execution via sandboxed dispatcher

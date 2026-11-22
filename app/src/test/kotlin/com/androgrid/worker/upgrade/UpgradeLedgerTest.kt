@@ -150,4 +150,33 @@ class UpgradeLedgerTest {
             )
         ).isFalse()
     }
+
+    @Test
+    fun testPendingUpgradeReconciliation_andClearLastOutcome() {
+        val ledger = SharedPreferencesUpgradeLedger(context)
+        val targetVersion = "0.4.0"
+        val sha = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344"
+
+        ledger.recordPendingUpgrade(targetVersion, sha)
+
+        // Version mismatch during startup check
+        assertThat(ledger.checkPendingUpgradeOnStartup("0.3.9")).isFalse()
+        assertThat(ledger.getLastOutcome()).isNull()
+
+        // Version match during startup check
+        assertThat(ledger.checkPendingUpgradeOnStartup("0.4.0")).isTrue()
+
+        val outcome = ledger.getLastOutcome()
+        assertThat(outcome).isNotNull()
+        assertThat(outcome?.status).isEqualTo(UpgradeInstallStatus.UPGRADE_INSTALL_STATUS_SUCCEEDED)
+        assertThat(outcome?.targetVersion).isEqualTo(targetVersion)
+        assertThat(outcome?.apkSha256).isEqualTo(sha)
+
+        // Subsequent check returns false since pending was cleared
+        assertThat(ledger.checkPendingUpgradeOnStartup("0.4.0")).isFalse()
+
+        // Clear last outcome
+        ledger.clearLastOutcome()
+        assertThat(ledger.getLastOutcome()).isNull()
+    }
 }

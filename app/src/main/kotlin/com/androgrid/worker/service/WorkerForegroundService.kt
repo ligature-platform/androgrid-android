@@ -258,11 +258,18 @@ class WorkerForegroundService : Service() {
                             thermalStatus = initialThermal
                         )
 
+                        val clientVersion = try {
+                            val pkgInfo = packageManager.getPackageInfo(packageName, 0)
+                            pkgInfo.versionName ?: "0.0.1-alpha.4"
+                        } catch (_: Exception) {
+                            "0.0.1-alpha.4"
+                        }
+
                         // Step 1: Register node per [REQ-OP-001] with exponential backoff retry loop
                         val regBuilder = RegisterNodeRequest.newBuilder()
                             .setNodeId(nodeId)
                             .setCapabilities(capabilities)
-                            .setClientVersion("0.1.0")
+                            .setClientVersion(clientVersion)
                         app?.upgradeManager?.getLastOutcome()?.let { outcome ->
                             regBuilder.setLastUpgradeOutcome(outcome)
                         }
@@ -419,6 +426,7 @@ class WorkerForegroundService : Service() {
                                 val response = effectiveSyncResult.getOrNull()
                                 if (response != null) {
                                     taskProcessor.applySyncResponse(this, response, isThrottled)
+                                    app?.upgradeManager?.clearLastOutcome()
                                 }
                             }
 

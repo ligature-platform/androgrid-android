@@ -98,9 +98,19 @@ interface UpgradeManager {
     ): UpgradeOutcome
 
     /**
+     * Current installed application version name.
+     */
+    val currentVersion: String
+
+    /**
      * Returns the structured outcome of the most recent upgrade attempt to report to the orchestrator.
      */
     fun getLastOutcome(): LastUpgradeOutcome?
+
+    /**
+     * Clears the cached last upgrade outcome once acknowledged by the orchestrator.
+     */
+    fun clearLastOutcome()
 
     /**
      * Verifies whether the application is exempt from battery optimizations for unattended execution.
@@ -131,6 +141,10 @@ class DefaultUpgradeManager(
     private val archiveInfoParser: ((File) -> PackageInfo?)? = null
 ) : UpgradeManager {
 
+    init {
+        ledger.checkPendingUpgradeOnStartup(currentVersionProvider())
+    }
+
     companion object {
         private const val TAG: String = "DefaultUpgradeManager"
         private const val BUFFER_SIZE: Int = 64 * 1024
@@ -138,7 +152,13 @@ class DefaultUpgradeManager(
         private const val READ_TIMEOUT_MS: Int = 60_000
     }
 
+    override val currentVersion: String get() = currentVersionProvider().trim()
+
     override fun getLastOutcome(): LastUpgradeOutcome? = ledger.getLastOutcome()
+
+    override fun clearLastOutcome() {
+        ledger.clearLastOutcome()
+    }
 
     override suspend fun processUpgradeDirective(
         directive: NodeUpgradeDirective,
@@ -278,7 +298,7 @@ class DefaultUpgradeManager(
         // Step 9: Heterogeneous Installation Routing
         if (rootChecker.isDeviceRooted()) {
             Log.i(TAG, "Device is rooted; attempting unattended package manager install (pm install -r)")
-            val (exitCode, output) = executeRootInstall(destFile)
+            val (exitCode, output) = executeRootInstall(destFile, targetVersion, expectedSha256)
             if (exitCode == 0) {
                 Log.i(TAG, "Silent root install succeeded for version $targetVersion")
                 ledger.recordSuccess(targetVersion, expectedSha256)
@@ -389,14 +409,20 @@ class DefaultUpgradeManager(
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
-    private suspend fun executeRootInstall(apkFile: File): Pair<Int, String> {
+    private suspend fun executeRootInstall(
+        apkFile: File,
+        targetVersion: String,
+        expectedSha256: String
+    ): Pair<Int, String> {
         val size = apkFile.length()
         val cmd = "pm install -r -S $size"
         if (shellRunner != null) {
+            ledger.recordPendingUpgrade(targetVersion, expectedSha256)
             return shellRunner.invoke(cmd)
         }
         return withContext(Dispatchers.IO) {
             try {
+                ledger.recordPendingUpgrade(targetVersion, expectedSha256)
                 val process = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
                 // Stream APK bytes via stdin to bypass SELinux app_data_file path access restrictions
                 apkFile.inputStream().use { input ->

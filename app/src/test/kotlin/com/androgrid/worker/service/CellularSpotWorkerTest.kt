@@ -147,9 +147,11 @@ class CellularSpotWorkerTest {
     }
 
     private class FakeUpgradeManager(
-        var outcomeToReturn: UpgradeOutcome = UpgradeOutcome.UpToDate("0.1.0")
+        var outcomeToReturn: UpgradeOutcome = UpgradeOutcome.UpToDate("0.1.0"),
+        override val currentVersion: String = "0.1.0"
     ) : UpgradeManager {
         val processedDirectives = mutableListOf<Triple<NodeUpgradeDirective, Boolean, Boolean>>()
+        var clearLastOutcomeCalled = false
 
         override suspend fun processUpgradeDirective(
             directive: NodeUpgradeDirective,
@@ -161,6 +163,10 @@ class CellularSpotWorkerTest {
         }
 
         override fun getLastOutcome(): LastUpgradeOutcome? = null
+
+        override fun clearLastOutcome() {
+            clearLastOutcomeCalled = true
+        }
     }
 
     @Test
