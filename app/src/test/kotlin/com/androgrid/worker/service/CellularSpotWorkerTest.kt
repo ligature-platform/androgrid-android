@@ -5,9 +5,11 @@ import androidx.work.ListenableWorker
 import com.androgrid.v1.ClaimCellularTaskRequest
 import com.androgrid.v1.ClaimCellularTaskResponse
 import com.androgrid.v1.ExecutionEngine
+import com.androgrid.v1.NodeUpgradeDirective
 import com.androgrid.v1.SubmitCellularResultRequest
 import com.androgrid.v1.SubmitCellularResultResponse
 import com.androgrid.v1.TaskSpec
+import com.androgrid.v1.UpgradeNetworkPolicy
 import com.androgrid.worker.capability.BatteryStatus
 import com.androgrid.worker.capability.BatteryStatusProvider
 import com.androgrid.worker.capability.DeviceCapabilityProvider
@@ -22,6 +24,8 @@ import com.androgrid.worker.telemetry.DeviceThermalStatusListener
 import com.androgrid.worker.telemetry.InMemoryTaskLedgerRepository
 import com.androgrid.worker.telemetry.TaskLedgerStatus
 import com.androgrid.worker.telemetry.ThermalSafetyGuard
+import com.androgrid.worker.upgrade.UpgradeManager
+import com.androgrid.worker.upgrade.UpgradeOutcome
 import com.google.common.truth.Truth.assertThat
 import com.google.protobuf.ByteString
 import io.grpc.ManagedChannel
@@ -138,6 +142,21 @@ class CellularSpotWorkerTest {
                 stdoutBytes = "computation output for ${task.taskId}".toByteArray(),
                 durationMs = 50L
             )
+        }
+    }
+
+    private class FakeUpgradeManager(
+        var outcomeToReturn: UpgradeOutcome = UpgradeOutcome.UpToDate("0.1.0")
+    ) : UpgradeManager {
+        val processedDirectives = mutableListOf<Triple<NodeUpgradeDirective, Boolean, Boolean>>()
+
+        override suspend fun processUpgradeDirective(
+            directive: NodeUpgradeDirective,
+            isMetered: Boolean,
+            isWifi: Boolean
+        ): UpgradeOutcome {
+            processedDirectives.add(Triple(directive, isMetered, isWifi))
+            return outcomeToReturn
         }
     }
 
@@ -696,5 +715,87 @@ class CellularSpotWorkerTest {
         assertThat(result).isEqualTo(ListenableWorker.Result.retry())
         assertThat(ledger.ledgerSnapshot.value.tasksFailedCount).isEqualTo(0)
         assertThat(ledger.isRecorded("task_cell_ext_submit_drop", 1)).isFalse()
+    }
+
+    @Test
+    fun test_cellular_upgrade_directive_processed_when_no_task_available() = runTest {
+        val directive = NodeUpgradeDirective.newBuilder()
+            .setTargetVersion("0.2.0")
+            .setApkUrl("https://cluster.domain.com/v1/blobs/abc")
+            .setApkSha256("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .setNetworkPolicy(UpgradeNetworkPolicy.UPGRADE_NETWORK_POLICY_ALLOW_CELLULAR)
+            .build()
+
+        val rpc = FakeCellularRpc(
+            claimResponse = Result.success(
+                ClaimCellularTaskResponse.newBuilder()
+                    .setTaskAvailable(false)
+                    .setUpgradeDirective(directive)
+                    .build()
+            )
+        )
+        val upgradeManager = FakeUpgradeManager()
+        val workerLogic = CellularSpotWorkerLogic(
+            nodeId = "test_node_01",
+            batteryProvider = FakeBatteryProvider(BatteryStatus(levelPercent = 80, isCharging = false)),
+            capabilityProvider = DeviceCapabilityProvider(FakeRootChecker(), FakeSystemInfo()),
+            cellularClient = CellularTransportClient(rpcInvoker = rpc),
+            channelProvider = { MockChannel() },
+            upgradeManager = upgradeManager
+        )
+
+        val result = workerLogic.executeSpotTask()
+
+        assertThat(result).isEqualTo(ListenableWorker.Result.success())
+        assertThat(upgradeManager.processedDirectives).hasSize(1)
+        val (processedDirective, isMetered, isWifi) = upgradeManager.processedDirectives.first()
+        assertThat(processedDirective.targetVersion).isEqualTo("0.2.0")
+        assertThat(isMetered).isTrue()
+        assertThat(isWifi).isFalse()
+    }
+
+    @Test
+    fun test_cellular_upgrade_directive_processed_after_task_completion() = runTest {
+        val directive = NodeUpgradeDirective.newBuilder()
+            .setTargetVersion("0.2.0")
+            .setApkUrl("https://cluster.domain.com/v1/blobs/abc")
+            .setApkSha256("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .setNetworkPolicy(UpgradeNetworkPolicy.UPGRADE_NETWORK_POLICY_ALLOW_CELLULAR)
+            .build()
+
+        val task: TaskSpec = TaskSpec.newBuilder()
+            .setTaskId("task_with_upgrade")
+            .setRunAttempt(1)
+            .setEngine(ExecutionEngine.EXECUTION_ENGINE_WASM_WASI)
+            .setWasmBytecode(ByteString.copyFromUtf8("binary"))
+            .build()
+
+        val responseBuilder = ClaimCellularTaskResponse.newBuilder()
+            .setTaskAvailable(true)
+            .setTask(task)
+            .setUpgradeDirective(directive)
+
+        val rpc = FakeCellularRpc(
+            claimResponse = Result.success(responseBuilder.build())
+        )
+        val upgradeManager = FakeUpgradeManager()
+        val workerLogic = CellularSpotWorkerLogic(
+            nodeId = "test_node_01",
+            batteryProvider = FakeBatteryProvider(BatteryStatus(levelPercent = 80, isCharging = false)),
+            capabilityProvider = DeviceCapabilityProvider(FakeRootChecker(), FakeSystemInfo()),
+            cellularClient = CellularTransportClient(rpcInvoker = rpc),
+            dispatcher = TaskExecutionDispatcher(wasmEngine = EchoEngine()),
+            channelProvider = { MockChannel() },
+            upgradeManager = upgradeManager
+        )
+
+        val result = workerLogic.executeSpotTask()
+
+        assertThat(result).isEqualTo(ListenableWorker.Result.success())
+        assertThat(upgradeManager.processedDirectives).hasSize(1)
+        val (processedDirective, isMetered, isWifi) = upgradeManager.processedDirectives.first()
+        assertThat(processedDirective.targetVersion).isEqualTo("0.2.0")
+        assertThat(isMetered).isTrue()
+        assertThat(isWifi).isFalse()
     }
 }

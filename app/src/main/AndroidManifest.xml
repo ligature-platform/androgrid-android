@@ -14,6 +14,9 @@
     <!-- Android 13+ Notification Runtime Permission for Foreground Service visibility -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Optional permission for user-prompted OTA package installation on unrooted hardware -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <!-- Camera permissions for QR code enrollment scanner -->
     <!-- Traces to: [REQ-OP-001], [NFR-SEC-001] -->
     <uses-permission android:name="android.permission.CAMERA" />
@@ -72,6 +75,18 @@
                 <action android:name="com.androgrid.worker.action.STOP_PARTICIPATION" />
             </intent-filter>
         </receiver>
+
+        <!-- FileProvider for secure OTA APK installation without world-readable file leaks -->
+        <!-- Traces to: [INV-001], [NFR-SEC-001] -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
     </application>
 

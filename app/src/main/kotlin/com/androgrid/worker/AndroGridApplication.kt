@@ -91,6 +91,10 @@ class AndroGridApplication : Application() {
         )
     }
 
+    val upgradeManager: com.androgrid.worker.upgrade.UpgradeManager by lazy {
+        com.androgrid.worker.upgrade.DefaultUpgradeManager(this)
+    }
+
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         // Exclude TRIM_MEMORY_UI_HIDDEN (20) so backgrounding the UI does not evict active worker cache

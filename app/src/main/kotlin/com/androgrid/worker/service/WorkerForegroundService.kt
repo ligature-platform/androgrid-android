@@ -323,7 +323,8 @@ class WorkerForegroundService : Service() {
                                 } finally {
                                     lifecycleManager.releaseGeneration(genAlias)
                                 }
-                            }
+                            },
+                            upgradeManager = app?.upgradeManager
                         )
 
                         // Step 2: 2.0-second declarative synchronization loop per [REQ-OP-002]
@@ -498,7 +499,8 @@ internal class WifiSyncTaskProcessor(
     private val nodeId: String,
     private val activeJobs: ConcurrentHashMap<String, Job> = ConcurrentHashMap(),
     private val blobFetcher: (suspend (String) -> ByteArray)? = null,
-    private val fetchArtifactRpc: (suspend (FetchArtifactRequest) -> FetchArtifactResponse)? = null
+    private val fetchArtifactRpc: (suspend (FetchArtifactRequest) -> FetchArtifactResponse)? = null,
+    private val upgradeManager: com.androgrid.worker.upgrade.UpgradeManager? = null
 ) {
     /**
      * Cancels an active in-flight task by [taskId] if present in [activeJobs].
@@ -513,7 +515,7 @@ internal class WifiSyncTaskProcessor(
     }
 
     /**
-     * Applies cancellation directives and eligible task launches from [response].
+     * Applies cancellation directives, eligible task launches, and OTA upgrades from [response].
      * Processes `cancel_task_ids` before `desired_tasks` and regardless of thermal throttling
      * so cancelled tasks terminate promptly.
      *
@@ -528,6 +530,13 @@ internal class WifiSyncTaskProcessor(
     ) {
         response.cancelTaskIdsList.forEach { taskId ->
             cancelTask(taskId)
+        }
+        if (response.hasUpgradeDirective() && response.upgradeDirective.targetVersion.isNotBlank()) {
+            upgradeManager?.processUpgradeDirective(
+                directive = response.upgradeDirective,
+                isMetered = false,
+                isWifi = true
+            )
         }
         if (!isThrottled) {
             response.desiredTasksList.forEach { desiredTask ->

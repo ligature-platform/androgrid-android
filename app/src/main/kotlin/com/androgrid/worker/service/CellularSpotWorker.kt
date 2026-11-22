@@ -34,6 +34,7 @@ import com.androgrid.worker.telemetry.TaskLedgerEntry
 import com.androgrid.worker.telemetry.TaskLedgerRepository
 import com.androgrid.worker.telemetry.TaskLedgerStatus
 import com.androgrid.worker.telemetry.ThermalSafetyGuard
+import com.androgrid.worker.upgrade.UpgradeManager
 import io.grpc.ManagedChannel
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
@@ -55,7 +56,8 @@ class CellularSpotWorkerLogic(
     private val channelProvider: (() -> ManagedChannel)? = null,
     private val thermalListener: DeviceThermalStatusListener? = null,
     private val thermalGuard: ThermalSafetyGuard = ThermalSafetyGuard(),
-    private val ledgerRepository: TaskLedgerRepository? = null
+    private val ledgerRepository: TaskLedgerRepository? = null,
+    private val upgradeManager: UpgradeManager? = null
 ) {
     /**
      * Executes single spot task cycle: battery & thermal checks -> claim -> execute -> submit.
@@ -109,8 +111,16 @@ class CellularSpotWorkerLogic(
             }
         }
 
-        val task = when (claimOutcome) {
+        val (task, pendingUpgradeDirective) = when (claimOutcome) {
             is CellularClaimOutcome.NoTask -> {
+                return androidx.work.ListenableWorker.Result.success()
+            }
+            is CellularClaimOutcome.UpgradeAvailable -> {
+                upgradeManager?.processUpgradeDirective(
+                    directive = claimOutcome.directive,
+                    isMetered = true,
+                    isWifi = false
+                )
                 return androidx.work.ListenableWorker.Result.success()
             }
             is CellularClaimOutcome.TransientFailure -> {
@@ -140,7 +150,7 @@ class CellularSpotWorkerLogic(
                 }
                 return androidx.work.ListenableWorker.Result.success()
             }
-            is CellularClaimOutcome.TaskReady -> claimOutcome.task
+            is CellularClaimOutcome.TaskReady -> Pair(claimOutcome.task, claimOutcome.upgradeDirective)
         }
 
         // Step 5: Offline compute execution via sandboxed dispatcher
@@ -184,10 +194,17 @@ class CellularSpotWorkerLogic(
 
         // Even if result was rejected due to preemption (TASK_ATTEMPT_STALE),
         // worker returns success to complete WorkManager cycle
-        return if (submitResult.isSuccess || isStale) {
-            androidx.work.ListenableWorker.Result.success()
+        if (submitResult.isSuccess || isStale) {
+            if (pendingUpgradeDirective != null) {
+                upgradeManager?.processUpgradeDirective(
+                    directive = pendingUpgradeDirective,
+                    isMetered = true,
+                    isWifi = false
+                )
+            }
+            return androidx.work.ListenableWorker.Result.success()
         } else {
-            androidx.work.ListenableWorker.Result.retry()
+            return androidx.work.ListenableWorker.Result.retry()
         }
     }
 
@@ -307,7 +324,8 @@ class CellularSpotWorker(
                 capabilityProvider = capabilityProvider,
                 cellularClient = currentClient,
                 thermalListener = thermalListener,
-                ledgerRepository = ledgerRepository
+                ledgerRepository = ledgerRepository,
+                upgradeManager = app?.upgradeManager
             )
 
             val preClaimed = (renewalOutcome as? RenewalOutcome.Renewed<*>)?.trialResult as? CellularClaimOutcome
