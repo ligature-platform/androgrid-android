@@ -146,6 +146,21 @@ sequenceDiagram
 
 ---
 
+## Declarative OTA Upgrades & Headless Hardware Lifecycle
+
+The worker implements unattended Over-the-Air (OTA) upgrades guided by empirical findings from the Option A Hardware Verification Spike on physical hardware (Pixel 8 / Android 17, `AG-VERIFY-SPIKE-OTA-2026-V1`):
+
+1. **SELinux app_data_file Traversal Bypass (`su -c "pm install -r -S <byteSize>"`):**
+   Android SELinux policy enforces `neverallow system_server app_data_file:file read`. Even when executing shell commands under UID 0 (`su`), `PackageManagerService` running within `system_server` cannot read or open files residing in `/data/user/0/com.androgrid.worker/`. To eliminate security vulnerabilities associated with staging APK binaries in world-readable shared storage (`/sdcard/` or `/data/local/tmp/`), `UpgradeManager` streams the APK binary directly through standard input (`FD 0`) using the `-S <byteSize>` parameter.
+2. **Headless Process Revival (`ACTION_MY_PACKAGE_REPLACED`):**
+   Upon package replacement, `PackageManagerService` terminates the running application process. `PackageReplacedReceiver` intercepts `android.intent.action.MY_PACKAGE_REPLACED` without UI activity, restarting `WorkerForegroundService`. To guarantee resilience against aggressive OEM battery managers that throw `ForegroundServiceStartNotAllowedException`, `PackageReplacedRecoveryWorker` is enqueued via Jetpack WorkManager (`RUN_AS_NON_EXPEDITED_WORK_REQUEST`) as an automated recovery fallback.
+3. **Android KeyStore & mTLS Continuity (`[INV-002]`):**
+   Hardware-backed ECDSA NIST P-256 private keys are isolated by Linux UID (`10520`). Package replacement preserves UID continuity, ensuring all mTLS certificates and private keys survive intact without requiring re-pairing or operator intervention.
+4. **Pre-Install Cryptographic Authenticity (`[NFR-SEC-001]`):**
+   Before invoking root shell execution, `UpgradeManager` validates APK archive integrity via `PackageManager.getPackageArchiveInfo` and inspects `signingInfo` to confirm that the signing certificate lineage matches the installed application. Unauthorized or corrupted builds are rejected immediately in user space.
+
+---
+
 ## Architecture Decision Records (ADRs)
 
 For detailed design decisions and architectural trade-offs, consult the dedicated client ADRs:

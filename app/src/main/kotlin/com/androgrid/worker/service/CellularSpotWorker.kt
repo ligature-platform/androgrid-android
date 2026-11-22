@@ -32,8 +32,11 @@ import com.androgrid.worker.telemetry.DeviceThermalStatusListener
 import com.androgrid.worker.telemetry.SharedPreferencesTaskLedgerRepository
 import com.androgrid.worker.telemetry.TaskLedgerEntry
 import com.androgrid.worker.telemetry.TaskLedgerRepository
+import com.androgrid.v1.NodeUpgradeDirective
 import com.androgrid.worker.telemetry.TaskLedgerStatus
 import com.androgrid.worker.telemetry.ThermalSafetyGuard
+import com.androgrid.worker.upgrade.UpgradeDownloadWorker
+import com.androgrid.worker.upgrade.UpgradeManager
 import io.grpc.ManagedChannel
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
@@ -55,8 +58,19 @@ class CellularSpotWorkerLogic(
     private val channelProvider: (() -> ManagedChannel)? = null,
     private val thermalListener: DeviceThermalStatusListener? = null,
     private val thermalGuard: ThermalSafetyGuard = ThermalSafetyGuard(),
-    private val ledgerRepository: TaskLedgerRepository? = null
+    private val ledgerRepository: TaskLedgerRepository? = null,
+    private val upgradeManager: UpgradeManager? = null,
+    private val downloadScheduler: ((NodeUpgradeDirective) -> Unit)? = null
 ) {
+    private suspend fun handleCellularUpgradeDirective(directive: NodeUpgradeDirective) {
+        if (directive.networkPolicy == com.androgrid.v1.UpgradeNetworkPolicy.UPGRADE_NETWORK_POLICY_ALLOW_CELLULAR) {
+            if (downloadScheduler != null) {
+                downloadScheduler.invoke(directive)
+            } else {
+                upgradeManager?.processUpgradeDirective(directive, isMetered = true, isWifi = false)
+            }
+        }
+    }
     /**
      * Executes single spot task cycle: battery & thermal checks -> claim -> execute -> submit.
      * Postpones execution with Result.retry() if battery temperature > 38 C or OS reports thermal throttling.
@@ -84,6 +98,7 @@ class CellularSpotWorkerLogic(
         }
 
         // Step 3 & 4: Use pre-claimed outcome if provided, else build and send claim request
+        var sentOutcome: com.androgrid.v1.LastUpgradeOutcome? = null
         val claimOutcome = preClaimedOutcome ?: run {
             val capabilities = capabilityProvider.buildCapabilities(
                 currentTransport = NetworkTransportType.NETWORK_TRANSPORT_CELLULAR_WAN,
@@ -92,14 +107,21 @@ class CellularSpotWorkerLogic(
                 thermalStatus = thermalStatus
             )
 
-            val claimRequest = ClaimCellularTaskRequest.newBuilder()
+            val clientVersion = upgradeManager?.currentVersion ?: "0.0.1-alpha.4"
+
+            val claimRequestBuilder = ClaimCellularTaskRequest.newBuilder()
                 .setNodeId(nodeId)
                 .setCapabilities(capabilities)
                 .setBatteryLevelPct(battery.levelPercent)
                 .setIsCharging(battery.isCharging)
                 .setBatteryTemperatureCelsius(battery.temperatureCelsius)
                 .setThermalStatus(thermalStatus)
-                .build()
+                .setClientVersion(clientVersion)
+            sentOutcome = upgradeManager?.getLastOutcome()
+            if (sentOutcome != null) {
+                claimRequestBuilder.setLastUpgradeOutcome(sentOutcome)
+            }
+            val claimRequest = claimRequestBuilder.build()
 
             if (channelProvider != null) {
                 val channel = channelProvider.invoke()
@@ -109,8 +131,18 @@ class CellularSpotWorkerLogic(
             }
         }
 
-        val task = when (claimOutcome) {
+        val (task, pendingUpgradeDirective) = when (claimOutcome) {
             is CellularClaimOutcome.NoTask -> {
+                if (sentOutcome != null) {
+                    upgradeManager?.clearLastOutcome()
+                }
+                return androidx.work.ListenableWorker.Result.success()
+            }
+            is CellularClaimOutcome.UpgradeAvailable -> {
+                if (sentOutcome != null) {
+                    upgradeManager?.clearLastOutcome()
+                }
+                handleCellularUpgradeDirective(claimOutcome.directive)
                 return androidx.work.ListenableWorker.Result.success()
             }
             is CellularClaimOutcome.TransientFailure -> {
@@ -140,7 +172,12 @@ class CellularSpotWorkerLogic(
                 }
                 return androidx.work.ListenableWorker.Result.success()
             }
-            is CellularClaimOutcome.TaskReady -> claimOutcome.task
+            is CellularClaimOutcome.TaskReady -> {
+                if (sentOutcome != null) {
+                    upgradeManager?.clearLastOutcome()
+                }
+                Pair(claimOutcome.task, claimOutcome.upgradeDirective)
+            }
         }
 
         // Step 5: Offline compute execution via sandboxed dispatcher
@@ -184,10 +221,13 @@ class CellularSpotWorkerLogic(
 
         // Even if result was rejected due to preemption (TASK_ATTEMPT_STALE),
         // worker returns success to complete WorkManager cycle
-        return if (submitResult.isSuccess || isStale) {
-            androidx.work.ListenableWorker.Result.success()
+        if (submitResult.isSuccess || isStale) {
+            if (pendingUpgradeDirective != null) {
+                handleCellularUpgradeDirective(pendingUpgradeDirective)
+            }
+            return androidx.work.ListenableWorker.Result.success()
         } else {
-            androidx.work.ListenableWorker.Result.retry()
+            return androidx.work.ListenableWorker.Result.retry()
         }
     }
 
@@ -307,7 +347,11 @@ class CellularSpotWorker(
                 capabilityProvider = capabilityProvider,
                 cellularClient = currentClient,
                 thermalListener = thermalListener,
-                ledgerRepository = ledgerRepository
+                ledgerRepository = ledgerRepository,
+                upgradeManager = app?.upgradeManager,
+                downloadScheduler = { directive ->
+                    UpgradeDownloadWorker.schedule(applicationContext, directive)
+                }
             )
 
             val preClaimed = (renewalOutcome as? RenewalOutcome.Renewed<*>)?.trialResult as? CellularClaimOutcome

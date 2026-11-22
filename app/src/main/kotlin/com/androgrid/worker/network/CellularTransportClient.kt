@@ -5,6 +5,7 @@ import com.androgrid.v1.ClaimCellularTaskRequest
 import com.androgrid.v1.ClaimCellularTaskResponse
 import com.androgrid.v1.FetchArtifactRequest
 import com.androgrid.v1.FetchArtifactResponse
+import com.androgrid.v1.NodeUpgradeDirective
 import com.androgrid.v1.RenewCertificateRequest
 import com.androgrid.v1.RenewCertificateResponse
 import com.androgrid.v1.SubmitCellularResultRequest
@@ -101,7 +102,11 @@ class DefaultCellularRpcInvoker : CellularRpcInvoker {
  */
 sealed class CellularClaimOutcome {
     object NoTask : CellularClaimOutcome()
-    data class TaskReady(val task: TaskSpec) : CellularClaimOutcome()
+    data class TaskReady(
+        val task: TaskSpec,
+        val upgradeDirective: NodeUpgradeDirective? = null
+    ) : CellularClaimOutcome()
+    data class UpgradeAvailable(val directive: NodeUpgradeDirective) : CellularClaimOutcome()
     data class TerminalArtifactFailure(
         val task: TaskSpec,
         val errorCode: String,
@@ -210,8 +215,17 @@ class CellularTransportClient(
     ): CellularClaimOutcome {
         return try {
             val claimResponse = rpcInvoker.invokeClaim(channel, request)
+            val upgradeDirective = if (claimResponse.hasUpgradeDirective() && claimResponse.upgradeDirective.targetVersion.isNotBlank()) {
+                claimResponse.upgradeDirective
+            } else {
+                null
+            }
             if (!claimResponse.taskAvailable) {
-                return CellularClaimOutcome.NoTask
+                return if (upgradeDirective != null) {
+                    CellularClaimOutcome.UpgradeAvailable(upgradeDirective)
+                } else {
+                    CellularClaimOutcome.NoTask
+                }
             }
             val claimedTask = claimResponse.task
             val effectiveBlobFetcher: (suspend (String) -> ByteArray)? = blobFetcher ?: mtlsContext?.let { ctx ->
@@ -248,7 +262,7 @@ class CellularTransportClient(
                     rpcInvoker.invokeFetchArtifact(channel, fetchReq)
                 }
             ) {
-                is ArtifactResolution.Ready -> CellularClaimOutcome.TaskReady(resolution.task)
+                is ArtifactResolution.Ready -> CellularClaimOutcome.TaskReady(resolution.task, upgradeDirective)
                 is ArtifactResolution.TerminalFailure -> {
                     val failReport = SubmitCellularResultRequest.newBuilder()
                         .setNodeId(request.nodeId)

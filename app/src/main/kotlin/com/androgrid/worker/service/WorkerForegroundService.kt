@@ -3,6 +3,7 @@ package com.androgrid.worker.service
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -43,6 +44,7 @@ import com.androgrid.worker.telemetry.SharedPreferencesTaskLedgerRepository
 import com.androgrid.worker.telemetry.TaskLedgerEntry
 import com.androgrid.worker.telemetry.TaskLedgerRepository
 import com.androgrid.worker.telemetry.TaskLedgerStatus
+import com.androgrid.worker.upgrade.UpgradeOutcome
 import com.androgrid.worker.telemetry.ThermalSafetyGuard
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -74,6 +76,8 @@ class WorkerForegroundService : Service() {
 
     companion object {
         const val NOTIFICATION_ID: Int = 1001
+        const val NOTIFICATION_UPGRADE_ID: Int = 1002
+        const val NOTIFICATION_UPGRADE_REQUEST_CODE: Int = 1002
         const val CHANNEL_ID: String = "androgrid_worker_sync_channel"
 
         const val ACTION_START_SYNC: String = "com.androgrid.worker.action.START_SYNC"
@@ -258,12 +262,22 @@ class WorkerForegroundService : Service() {
                             thermalStatus = initialThermal
                         )
 
+                        val clientVersion = try {
+                            val pkgInfo = packageManager.getPackageInfo(packageName, 0)
+                            pkgInfo.versionName ?: "0.0.1-alpha.4"
+                        } catch (_: Exception) {
+                            "0.0.1-alpha.4"
+                        }
+
                         // Step 1: Register node per [REQ-OP-001] with exponential backoff retry loop
-                        val regRequest = RegisterNodeRequest.newBuilder()
+                        val regBuilder = RegisterNodeRequest.newBuilder()
                             .setNodeId(nodeId)
                             .setCapabilities(capabilities)
-                            .setClientVersion("0.1.0")
-                            .build()
+                            .setClientVersion(clientVersion)
+                        app?.upgradeManager?.getLastOutcome()?.let { outcome ->
+                            regBuilder.setLastUpgradeOutcome(outcome)
+                        }
+                        val regRequest = regBuilder.build()
 
                         var sessionToken = ""
                         var retryDelayMs = SYNC_INTERVAL_MS
@@ -323,6 +337,10 @@ class WorkerForegroundService : Service() {
                                 } finally {
                                     lifecycleManager.releaseGeneration(genAlias)
                                 }
+                            },
+                            upgradeManager = app?.upgradeManager,
+                            onPromptUserInstall = { intent ->
+                                showUpgradePromptNotification(intent)
                             }
                         )
 
@@ -337,11 +355,15 @@ class WorkerForegroundService : Service() {
                                 completedReports.poll()?.let { reportsToSend.add(it) }
                             }
 
-                            val syncRequest = SyncNodeStateRequest.newBuilder()
+                            val syncBuilder = SyncNodeStateRequest.newBuilder()
                                 .setNodeId(nodeId)
                                 .setSessionToken(sessionToken)
                                 .addAllCompletedTasks(reportsToSend)
-                                .build()
+                            val sentOutcome = app?.upgradeManager?.getLastOutcome()
+                            if (sentOutcome != null) {
+                                syncBuilder.setLastUpgradeOutcome(sentOutcome)
+                            }
+                            val syncRequest = syncBuilder.build()
 
                             // Check in-band certificate renewal without dropping session_token or active tasks
                             val currentSettings = settingsRepo.getSettings()
@@ -411,6 +433,9 @@ class WorkerForegroundService : Service() {
                             if (effectiveSyncResult.isSuccess) {
                                 val response = effectiveSyncResult.getOrNull()
                                 if (response != null) {
+                                    if (sentOutcome != null) {
+                                        app?.upgradeManager?.clearLastOutcome()
+                                    }
                                     taskProcessor.applySyncResponse(this, response, isThrottled)
                                 }
                             }
@@ -470,6 +495,25 @@ class WorkerForegroundService : Service() {
             .build()
     }
 
+    private fun showUpgradePromptNotification(installIntent: Intent) {
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            NOTIFICATION_UPGRADE_REQUEST_CODE,
+            installIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("AndroGrid Update Ready")
+            .setContentText("Tap to complete package update")
+            .setSmallIcon(R.drawable.ic_stat_androgrid)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        manager?.notify(NOTIFICATION_UPGRADE_ID, notification)
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -498,8 +542,13 @@ internal class WifiSyncTaskProcessor(
     private val nodeId: String,
     private val activeJobs: ConcurrentHashMap<String, Job> = ConcurrentHashMap(),
     private val blobFetcher: (suspend (String) -> ByteArray)? = null,
-    private val fetchArtifactRpc: (suspend (FetchArtifactRequest) -> FetchArtifactResponse)? = null
+    private val fetchArtifactRpc: (suspend (FetchArtifactRequest) -> FetchArtifactResponse)? = null,
+    private val upgradeManager: com.androgrid.worker.upgrade.UpgradeManager? = null,
+    private val onPromptUserInstall: ((Intent) -> Unit)? = null
 ) {
+    private val isDrainingForUpgrade = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val isProcessingUpgrade = java.util.concurrent.atomic.AtomicBoolean(false)
+
     /**
      * Cancels an active in-flight task by [taskId] if present in [activeJobs].
      *
@@ -513,9 +562,11 @@ internal class WifiSyncTaskProcessor(
     }
 
     /**
-     * Applies cancellation directives and eligible task launches from [response].
+     * Applies cancellation directives, eligible task launches, and OTA upgrades from [response].
      * Processes `cancel_task_ids` before `desired_tasks` and regardless of thermal throttling
      * so cancelled tasks terminate promptly.
+     * If `drain_before_upgrade` is set on the upgrade directive, pauses new task execution
+     * and drains running tasks before initiating the upgrade.
      *
      * @param scope coroutine scope for launching eligible tasks.
      * @param response orchestrator `SyncNodeStateResponse` payload.
@@ -529,7 +580,51 @@ internal class WifiSyncTaskProcessor(
         response.cancelTaskIdsList.forEach { taskId ->
             cancelTask(taskId)
         }
-        if (!isThrottled) {
+
+        val hasUpgrade = response.hasUpgradeDirective() && response.upgradeDirective.targetVersion.isNotBlank()
+        val directive = if (hasUpgrade) response.upgradeDirective else null
+        val shouldDrain = directive?.drainBeforeUpgrade == true
+
+        if (directive != null && shouldDrain) {
+            if (isDrainingForUpgrade.compareAndSet(false, true)) {
+                scope.launch {
+                    try {
+                        while (activeJobs.isNotEmpty() || completedReports.isNotEmpty()) {
+                            delay(100L)
+                        }
+                        val outcome = upgradeManager?.processUpgradeDirective(
+                            directive = directive,
+                            isMetered = false,
+                            isWifi = true
+                        )
+                        if (outcome is UpgradeOutcome.PromptUserInstall) {
+                            onPromptUserInstall?.invoke(outcome.intent)
+                        }
+                    } finally {
+                        isDrainingForUpgrade.set(false)
+                    }
+                }
+            }
+        } else if (directive != null) {
+            if (isProcessingUpgrade.compareAndSet(false, true)) {
+                scope.launch {
+                    try {
+                        val outcome = upgradeManager?.processUpgradeDirective(
+                            directive = directive,
+                            isMetered = false,
+                            isWifi = true
+                        )
+                        if (outcome is UpgradeOutcome.PromptUserInstall) {
+                            onPromptUserInstall?.invoke(outcome.intent)
+                        }
+                    } finally {
+                        isProcessingUpgrade.set(false)
+                    }
+                }
+            }
+        }
+
+        if (!isThrottled && !isDrainingForUpgrade.get() && !shouldDrain) {
             response.desiredTasksList.forEach { desiredTask ->
                 launchTaskIfEligible(scope, desiredTask)
             }

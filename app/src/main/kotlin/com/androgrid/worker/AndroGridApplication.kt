@@ -91,6 +91,51 @@ class AndroGridApplication : Application() {
         )
     }
 
+    val upgradeManager: com.androgrid.worker.upgrade.UpgradeManager by lazy {
+        com.androgrid.worker.upgrade.DefaultUpgradeManager(
+            context = this,
+            mtlsClientProvider = {
+                val settings = settingsRepository.getSettings()
+                if (settings.hasMtlsCredentials) {
+                    val activeAlias = settings.clientKeyPem.removePrefix("keystore:")
+                        .takeIf { settings.clientKeyPem.startsWith("keystore:") }
+                        ?: com.androgrid.worker.enrollment.AndroidKeyStoreEnrollmentProvider.DEFAULT_ENROLLMENT_ALIAS
+                    val mtlsContext = credentialLifecycleManager.createCandidateMtlsContext(activeAlias, settings.caCertPem)
+                    val authority = if (com.androgrid.worker.network.OkHttpBlobFetcher.isLoopbackHost(settings.wifiHost)) "localhost" else null
+                    com.androgrid.worker.network.OkHttpBlobFetcher.buildMtlsClient(
+                        mtlsContext = mtlsContext,
+                        allowLocalhostLoopback = authority != null,
+                        ephemeralPool = true
+                    )
+                } else null
+            },
+            baseUrlProvider = { isWifi ->
+                val settings = settingsRepository.getSettings()
+                val host = if (isWifi && settings.wifiHost.isNotBlank()) {
+                    settings.wifiHost
+                } else if (!isWifi && settings.cellularHost.isNotBlank()) {
+                    settings.cellularHost
+                } else if (settings.wifiHost.isNotBlank()) {
+                    settings.wifiHost
+                } else {
+                    settings.cellularHost
+                }
+                val port = if (isWifi && settings.wifiPort > 0) {
+                    settings.wifiPort
+                } else if (!isWifi && settings.cellularPort > 0) {
+                    settings.cellularPort
+                } else if (settings.wifiPort > 0) {
+                    settings.wifiPort
+                } else {
+                    settings.cellularPort
+                }
+                if (host.isNotBlank() && port > 0) {
+                    "https://$host:$port"
+                } else null
+            }
+        )
+    }
+
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         // Exclude TRIM_MEMORY_UI_HIDDEN (20) so backgrounding the UI does not evict active worker cache
