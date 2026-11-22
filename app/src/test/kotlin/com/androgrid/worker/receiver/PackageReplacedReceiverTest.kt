@@ -2,11 +2,14 @@ package com.androgrid.worker.receiver
 
 import android.content.Context
 import android.content.Intent
+import androidx.work.ListenableWorker
+import androidx.work.testing.TestListenableWorkerBuilder
 import com.androgrid.worker.network.ClusterSettings
 import com.androgrid.worker.network.SharedPreferencesClusterSettingsRepository
 import com.androgrid.worker.service.DefaultWorkerParticipationController
 import com.androgrid.worker.service.WorkerForegroundService
 import com.google.common.truth.Truth.assertThat
+import kotlinx.coroutines.runBlocking
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -95,5 +98,18 @@ class PackageReplacedReceiverTest {
 
         val shadowApp = shadowOf(RuntimeEnvironment.getApplication())
         assertThat(shadowApp.nextStartedService).isNull()
+    }
+
+    @Test
+    fun testPackageReplacedRecoveryWorker_restoresWorkerForegroundService() = runBlocking {
+        val worker = TestListenableWorkerBuilder<PackageReplacedRecoveryWorker>(context).build()
+        val result = worker.doWork()
+
+        assertThat(result).isEqualTo(ListenableWorker.Result.success())
+        val shadowApp = shadowOf(RuntimeEnvironment.getApplication())
+        val nextServiceIntent = shadowApp.nextStartedService
+        assertThat(nextServiceIntent).isNotNull()
+        assertThat(nextServiceIntent.component?.className).isEqualTo(WorkerForegroundService::class.java.name)
+        assertThat(nextServiceIntent.action).isEqualTo(WorkerForegroundService.ACTION_START_SYNC)
     }
 }

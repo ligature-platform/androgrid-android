@@ -374,7 +374,46 @@ class UpgradeManagerTest {
         assertThat(outcome).isInstanceOf(UpgradeOutcome.InstalledRoot::class.java)
         val installed = outcome as UpgradeOutcome.InstalledRoot
         assertThat(installed.exitCode).isEqualTo(0)
-        assertThat(executedCommand).contains("pm install -r")
+        assertThat(executedCommand).isEqualTo("pm install -r -S ${apkPayload.size}")
+    }
+
+    @Test
+    fun testProcessUpgradeDirective_signingCertificateMismatch_rejectsBeforeSuInvocation() = runTest {
+        val apkPayload = "mismatched-cert-payload".toByteArray()
+        val payloadSha256 = computeSha256(apkPayload)
+
+        var shellRunnerInvoked = false
+        val manager = DefaultUpgradeManager(
+            context = context,
+            rootChecker = FakeRootChecker(rooted = true),
+            currentVersionProvider = { "0.1.0" },
+            downloadClient = { _, destFile ->
+                destFile.writeBytes(apkPayload)
+                true
+            },
+            shellRunner = { _ ->
+                shellRunnerInvoked = true
+                Pair(0, "Success")
+            },
+            archiveInfoParser = { PackageInfo() },
+            signatureVerifier = { _, _ -> false }
+        )
+
+        val directive = NodeUpgradeDirective.newBuilder()
+            .setTargetVersion("0.2.0")
+            .setApkUrl("https://example.com/app.apk")
+            .setApkSha256(payloadSha256)
+            .build()
+
+        val outcome = manager.processUpgradeDirective(
+            directive = directive,
+            isMetered = false,
+            isWifi = true
+        )
+
+        assertThat(outcome).isInstanceOf(UpgradeOutcome.SignatureVerificationFailed::class.java)
+        // Verify root shell command was NEVER executed
+        assertThat(shellRunnerInvoked).isFalse()
     }
 
     @Test

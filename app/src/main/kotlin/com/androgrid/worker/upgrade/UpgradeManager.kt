@@ -6,6 +6,7 @@ import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.content.pm.Signature
 import android.net.Uri
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.content.FileProvider
 import com.androgrid.v1.LastUpgradeOutcome
@@ -100,6 +101,11 @@ interface UpgradeManager {
      * Returns the structured outcome of the most recent upgrade attempt to report to the orchestrator.
      */
     fun getLastOutcome(): LastUpgradeOutcome?
+
+    /**
+     * Verifies whether the application is exempt from battery optimizations for unattended execution.
+     */
+    fun isBatteryOptimizationIgnored(): Boolean = false
 }
 
 /**
@@ -305,6 +311,11 @@ class DefaultUpgradeManager(
         UpgradeOutcome.PromptUserInstall(installIntent, destFile)
     }
 
+    override fun isBatteryOptimizationIgnored(): Boolean {
+        val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        return powerManager?.isIgnoringBatteryOptimizations(context.packageName) ?: false
+    }
+
     private fun getInstalledPackageSigners(): Array<Signature>? {
         return try {
             val flags = PackageManager.GET_SIGNING_CERTIFICATES
@@ -316,21 +327,30 @@ class DefaultUpgradeManager(
     }
 
     private fun getArchiveSigners(archiveInfo: PackageInfo): Array<Signature>? {
-        return archiveInfo.signingInfo?.apkContentsSigners
+        val signingInfo = archiveInfo.signingInfo ?: return null
+        val signers = mutableListOf<Signature>()
+        signingInfo.apkContentsSigners?.let { signers.addAll(it) }
+        signingInfo.signingCertificateHistory?.let { signers.addAll(it) }
+        return if (signers.isNotEmpty()) signers.toTypedArray() else null
+    }
+
+    private fun computeCertSha256(signature: Signature): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        return digest.digest(signature.toByteArray()).joinToString("") { "%02x".format(it) }
     }
 
     private fun verifySignerLineage(
         installed: Array<Signature>?,
         archive: Array<Signature>?
     ): Boolean {
-        if (installed == null || archive == null) {
+        if (archive.isNullOrEmpty()) {
+            return false
+        }
+        if (installed.isNullOrEmpty()) {
             return true
         }
-        if (installed.isEmpty() || archive.isEmpty()) {
-            return true
-        }
-        val installedDigests = installed.map { it.toByteArray().contentHashCode() }.toSet()
-        val archiveDigests = archive.map { it.toByteArray().contentHashCode() }.toSet()
+        val installedDigests = installed.map { computeCertSha256(it) }.toSet()
+        val archiveDigests = archive.map { computeCertSha256(it) }.toSet()
         return installedDigests.intersect(archiveDigests).isNotEmpty()
     }
 
@@ -370,12 +390,21 @@ class DefaultUpgradeManager(
     }
 
     private suspend fun executeRootInstall(apkFile: File): Pair<Int, String> {
+        val size = apkFile.length()
+        val cmd = "pm install -r -S $size"
         if (shellRunner != null) {
-            return shellRunner.invoke("pm install -r ${apkFile.absolutePath}")
+            return shellRunner.invoke(cmd)
         }
         return withContext(Dispatchers.IO) {
             try {
-                val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "pm install -r ${apkFile.absolutePath}"))
+                val process = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+                // Stream APK bytes via stdin to bypass SELinux app_data_file path access restrictions
+                apkFile.inputStream().use { input ->
+                    process.outputStream.use { output ->
+                        input.copyTo(output)
+                        output.flush()
+                    }
+                }
                 val output = process.inputStream.bufferedReader().use { it.readText() } +
                     process.errorStream.bufferedReader().use { it.readText() }
                 val exitCode = process.waitFor()

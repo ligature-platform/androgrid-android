@@ -17,6 +17,10 @@
     <!-- Optional permission for user-prompted OTA package installation on unrooted hardware -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
+    <!-- Battery optimization exemption for unattended continuous execution -->
+    <!-- Traces to: [REQ-OP-001], [NFR-REL-001] -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <!-- Camera permissions for QR code enrollment scanner -->
     <!-- Traces to: [REQ-OP-001], [NFR-SEC-001] -->
     <uses-permission android:name="android.permission.CAMERA" />
