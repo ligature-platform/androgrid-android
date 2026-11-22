@@ -48,7 +48,7 @@
 
 # Preserve AndroGrid worker service classes instantiated via reflection by WorkManager
 -keep class com.androgrid.worker.service.** { *; }
--keepclassmembers class * extends androidx.work.ListenableWorker {
+-keep class * extends androidx.work.ListenableWorker {
     public <init>(android.content.Context, androidx.work.WorkerParameters);
 }
 

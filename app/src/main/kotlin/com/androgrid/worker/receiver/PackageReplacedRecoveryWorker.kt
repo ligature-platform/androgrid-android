@@ -24,13 +24,17 @@ class PackageReplacedRecoveryWorker(
         val serviceIntent = Intent(applicationContext, WorkerForegroundService::class.java).apply {
             action = WorkerForegroundService.ACTION_START_SYNC
         }
+        if (runAttemptCount >= 3) {
+            Log.w(TAG, "PackageReplacedRecoveryWorker exceeded max recovery retries (3); aborting")
+            return Result.failure()
+        }
         return try {
             ContextCompat.startForegroundService(applicationContext, serviceIntent)
             Log.i(TAG, "WorkerForegroundService successfully restored via WorkManager recovery bootstrap")
             Result.success()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to restore WorkerForegroundService from WorkManager bootstrap: ${e.message}", e)
-            Result.retry()
+            if (runAttemptCount >= 2) Result.failure() else Result.retry()
         }
     }
 

@@ -51,8 +51,12 @@ class UpgradeDownloadWorker(
 
         return when (val outcome = upgradeManager.processUpgradeDirective(directive, isMetered = true, isWifi = false)) {
             is UpgradeOutcome.InstalledRoot,
-            is UpgradeOutcome.PromptUserInstall,
             is UpgradeOutcome.UpToDate -> Result.success()
+            is UpgradeOutcome.PromptUserInstall -> {
+                applicationContext.startActivity(outcome.intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                Result.success()
+            }
+            is UpgradeOutcome.BackoffSuppressed -> Result.retry()
             is UpgradeOutcome.TerminallyRejected,
             is UpgradeOutcome.SignatureVerificationFailed,
             is UpgradeOutcome.NetworkPolicyViolation -> Result.failure()
