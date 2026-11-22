@@ -13,6 +13,7 @@ import com.google.common.truth.Truth.assertThat
 import com.google.protobuf.ByteString
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
 import java.util.concurrent.ConcurrentHashMap
@@ -452,5 +453,72 @@ class WorkerForegroundServiceTest {
         assertThat(attempt2SawAttempt1CleanedUp.get()).isTrue()
         assertThat(maxConcurrent.get()).isEqualTo(1)
         assertThat(activeJobs).isEmpty()
+    }
+
+    @Test
+    fun testApplySyncResponse_drainBeforeUpgrade_waitsForActiveJobsAndSuppressesNewTasks() = runTest {
+        val activeJobs = ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+        var upgradeProcessed = false
+        val fakeUpgradeManager = object : com.androgrid.worker.upgrade.UpgradeManager {
+            override val currentVersion: String = "0.1.0"
+            override fun getLastOutcome(): com.androgrid.v1.LastUpgradeOutcome? = null
+            override fun clearLastOutcome() {}
+            override suspend fun processUpgradeDirective(
+                directive: com.androgrid.v1.NodeUpgradeDirective,
+                isMetered: Boolean,
+                isWifi: Boolean
+            ): com.androgrid.worker.upgrade.UpgradeOutcome {
+                upgradeProcessed = true
+                return com.androgrid.worker.upgrade.UpgradeOutcome.UpToDate("0.2.0")
+            }
+        }
+
+        val processor = WifiSyncTaskProcessor(
+            dispatcher = TaskExecutionDispatcher(),
+            ledgerRepository = InMemoryTaskLedgerRepository(),
+            nodeId = "wifi-drain-node",
+            activeJobs = activeJobs,
+            upgradeManager = fakeUpgradeManager
+        )
+
+        // Simulate an in-flight active job
+        val activeJobDeferred = CompletableDeferred<Unit>()
+        val dummyJob = launch { activeJobDeferred.await() }
+        activeJobs["active-task-1"] = dummyJob
+
+        val directive = com.androgrid.v1.NodeUpgradeDirective.newBuilder()
+            .setTargetVersion("0.2.0")
+            .setApkUrl("https://cluster.local/v1/blobs/abc")
+            .setApkSha256("0000000000000000000000000000000000000000000000000000000000000000")
+            .setDrainBeforeUpgrade(true)
+            .build()
+
+        val desiredTask = TaskSpec.newBuilder()
+            .setTaskId("suppressed-task")
+            .setRunAttempt(1)
+            .setEngine(ExecutionEngine.EXECUTION_ENGINE_WASM_WASI)
+            .setWasmBytecode(ByteString.copyFrom(byteArrayOf(0x00, 0x61, 0x73, 0x6D)))
+            .build()
+
+        val syncResponse = com.androgrid.v1.SyncNodeStateResponse.newBuilder()
+            .setUpgradeDirective(directive)
+            .addDesiredTasks(desiredTask)
+            .build()
+
+        processor.applySyncResponse(this, syncResponse, isThrottled = false)
+
+        // New task must NOT have been launched
+        assertThat(activeJobs.containsKey("suppressed-task")).isFalse()
+        // Upgrade must NOT have processed yet while active job is running
+        assertThat(upgradeProcessed).isFalse()
+
+        // Complete the active job
+        activeJobDeferred.complete(Unit)
+        dummyJob.join()
+        activeJobs.remove("active-task-1")
+
+        // Allow drain coroutine to detect empty activeJobs
+        kotlinx.coroutines.delay(200L)
+        assertThat(upgradeProcessed).isTrue()
     }
 }

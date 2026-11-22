@@ -92,7 +92,11 @@ class UpgradeDownloadWorker(
                 )
                 .build()
 
-            WorkManager.getInstance(context).enqueue(request)
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                WORK_NAME,
+                androidx.work.ExistingWorkPolicy.KEEP,
+                request
+            )
             return request
         }
     }

@@ -30,6 +30,8 @@ class UpgradeDownloadWorkerTest {
     @Before
     fun setUp() {
         context = RuntimeEnvironment.getApplication()
+        val config = androidx.work.Configuration.Builder().build()
+        androidx.work.testing.WorkManagerTestInitHelper.initializeTestWorkManager(context, config)
     }
 
     @Test

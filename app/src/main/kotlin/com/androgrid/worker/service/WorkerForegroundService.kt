@@ -516,6 +516,8 @@ internal class WifiSyncTaskProcessor(
     private val fetchArtifactRpc: (suspend (FetchArtifactRequest) -> FetchArtifactResponse)? = null,
     private val upgradeManager: com.androgrid.worker.upgrade.UpgradeManager? = null
 ) {
+    private val isDrainingForUpgrade = java.util.concurrent.atomic.AtomicBoolean(false)
+
     /**
      * Cancels an active in-flight task by [taskId] if present in [activeJobs].
      *
@@ -532,6 +534,8 @@ internal class WifiSyncTaskProcessor(
      * Applies cancellation directives, eligible task launches, and OTA upgrades from [response].
      * Processes `cancel_task_ids` before `desired_tasks` and regardless of thermal throttling
      * so cancelled tasks terminate promptly.
+     * If `drain_before_upgrade` is set on the upgrade directive, pauses new task execution
+     * and drains running tasks before initiating the upgrade.
      *
      * @param scope coroutine scope for launching eligible tasks.
      * @param response orchestrator `SyncNodeStateResponse` payload.
@@ -545,14 +549,37 @@ internal class WifiSyncTaskProcessor(
         response.cancelTaskIdsList.forEach { taskId ->
             cancelTask(taskId)
         }
-        if (response.hasUpgradeDirective() && response.upgradeDirective.targetVersion.isNotBlank()) {
+
+        val hasUpgrade = response.hasUpgradeDirective() && response.upgradeDirective.targetVersion.isNotBlank()
+        val directive = if (hasUpgrade) response.upgradeDirective else null
+        val shouldDrain = directive?.drainBeforeUpgrade == true
+
+        if (directive != null && shouldDrain) {
+            if (isDrainingForUpgrade.compareAndSet(false, true)) {
+                scope.launch {
+                    try {
+                        while (activeJobs.isNotEmpty()) {
+                            delay(100L)
+                        }
+                        upgradeManager?.processUpgradeDirective(
+                            directive = directive,
+                            isMetered = false,
+                            isWifi = true
+                        )
+                    } finally {
+                        isDrainingForUpgrade.set(false)
+                    }
+                }
+            }
+        } else if (directive != null) {
             upgradeManager?.processUpgradeDirective(
-                directive = response.upgradeDirective,
+                directive = directive,
                 isMetered = false,
                 isWifi = true
             )
         }
-        if (!isThrottled) {
+
+        if (!isThrottled && !isDrainingForUpgrade.get() && !shouldDrain) {
             response.desiredTasksList.forEach { desiredTask ->
                 launchTaskIfEligible(scope, desiredTask)
             }
