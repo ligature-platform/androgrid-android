@@ -56,6 +56,20 @@ class UpgradeManagerTest {
         return md.digest(bytes).joinToString("") { "%02x".format(it) }
     }
 
+    private fun createValidArchiveInfo(
+        pkgName: String = context.packageName,
+        verCode: Long = 100L
+    ): PackageInfo {
+        return PackageInfo().apply {
+            packageName = pkgName
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                longVersionCode = verCode
+            }
+            @Suppress("DEPRECATION")
+            versionCode = verCode.toInt()
+        }
+    }
+
     @Test
     fun testProcessUpgradeDirective_alreadyUpToDate_returnsUpToDate() = runTest {
         val manager = DefaultUpgradeManager(
@@ -139,7 +153,7 @@ class UpgradeManagerTest {
                 destFile.writeBytes(apkPayload)
                 true
             },
-            archiveInfoParser = { PackageInfo() },
+            archiveInfoParser = { createValidArchiveInfo() },
             signatureVerifier = { _, _ -> true }
         )
 
@@ -270,7 +284,7 @@ class UpgradeManagerTest {
                 createdFile = destFile
                 true
             },
-            archiveInfoParser = { PackageInfo() },
+            archiveInfoParser = { createValidArchiveInfo() },
             signatureVerifier = { _, _ -> false }
         )
 
@@ -355,7 +369,7 @@ class UpgradeManagerTest {
                 executedCommand = cmd
                 Pair(0, "Success")
             },
-            archiveInfoParser = { PackageInfo() },
+            archiveInfoParser = { createValidArchiveInfo() },
             signatureVerifier = { _, _ -> true }
         )
 
@@ -395,7 +409,7 @@ class UpgradeManagerTest {
                 shellRunnerInvoked = true
                 Pair(0, "Success")
             },
-            archiveInfoParser = { PackageInfo() },
+            archiveInfoParser = { createValidArchiveInfo() },
             signatureVerifier = { _, _ -> false }
         )
 
@@ -429,7 +443,7 @@ class UpgradeManagerTest {
                 destFile.writeBytes(apkPayload)
                 true
             },
-            archiveInfoParser = { PackageInfo() },
+            archiveInfoParser = { createValidArchiveInfo() },
             signatureVerifier = { _, _ -> true }
         )
 
@@ -452,5 +466,83 @@ class UpgradeManagerTest {
         assertThat(intent.action).isEqualTo(Intent.ACTION_VIEW)
         assertThat(intent.type).isEqualTo("application/vnd.android.package-archive")
         assertThat(intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION).isNotEqualTo(0)
+    }
+
+    @Test
+    fun testProcessUpgradeDirective_packageNameMismatch_terminallyRejected() = runTest {
+        val apkPayload = "valid-binary-different-package".toByteArray()
+        val payloadSha256 = computeSha256(apkPayload)
+
+        val manager = DefaultUpgradeManager(
+            context = context,
+            rootChecker = FakeRootChecker(rooted = false),
+            currentVersionProvider = { "0.1.0" },
+            downloadClient = { _, destFile ->
+                destFile.writeBytes(apkPayload)
+                true
+            },
+            archiveInfoParser = { createValidArchiveInfo(pkgName = "com.other.malicious") },
+            signatureVerifier = { _, _ -> true }
+        )
+
+        val directive = NodeUpgradeDirective.newBuilder()
+            .setTargetVersion("0.2.0")
+            .setApkUrl("https://example.com/app.apk")
+            .setApkSha256(payloadSha256)
+            .build()
+
+        val outcome = manager.processUpgradeDirective(directive, isMetered = false, isWifi = true)
+        assertThat(outcome).isInstanceOf(UpgradeOutcome.TerminallyRejected::class.java)
+        val term = outcome as UpgradeOutcome.TerminallyRejected
+        assertThat(term.reason).contains("package name mismatch")
+    }
+
+    @Test
+    fun testProcessUpgradeDirective_versionCodeDowngrade_terminallyRejected() = runTest {
+        val apkPayload = "valid-binary-downgrade".toByteArray()
+        val payloadSha256 = computeSha256(apkPayload)
+
+        val manager = DefaultUpgradeManager(
+            context = context,
+            rootChecker = FakeRootChecker(rooted = false),
+            currentVersionProvider = { "0.1.0" },
+            downloadClient = { _, destFile ->
+                destFile.writeBytes(apkPayload)
+                true
+            },
+            archiveInfoParser = { createValidArchiveInfo(verCode = 0L) },
+            signatureVerifier = { _, _ -> true }
+        )
+
+        val directive = NodeUpgradeDirective.newBuilder()
+            .setTargetVersion("0.2.0")
+            .setApkUrl("https://example.com/app.apk")
+            .setApkSha256(payloadSha256)
+            .build()
+
+        val outcome = manager.processUpgradeDirective(directive, isMetered = false, isWifi = true)
+        assertThat(outcome).isInstanceOf(UpgradeOutcome.TerminallyRejected::class.java)
+        val term = outcome as UpgradeOutcome.TerminallyRejected
+        assertThat(term.reason).contains("version code downgrade")
+    }
+
+    @Test
+    fun testProcessUpgradeDirective_invalidSha256_terminallyRejected() = runTest {
+        val manager = DefaultUpgradeManager(
+            context = context,
+            rootChecker = FakeRootChecker(rooted = false),
+            currentVersionProvider = { "0.1.0" }
+        )
+
+        val directive = NodeUpgradeDirective.newBuilder()
+            .setTargetVersion("0.2.0")
+            .setApkUrl("https://example.com/app.apk")
+            .setApkSha256("invalid_hash_not_64_hex")
+            .build()
+
+        val outcome = manager.processUpgradeDirective(directive, isMetered = false, isWifi = true)
+        assertThat(outcome).isInstanceOf(UpgradeOutcome.TerminallyRejected::class.java)
+        val term = outcome as UpgradeOutcome.TerminallyRejected
+        assertThat(term.reason).contains("invalid 64-hex SHA-256")
     }
 }

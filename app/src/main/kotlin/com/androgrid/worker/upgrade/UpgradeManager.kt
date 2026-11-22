@@ -9,12 +9,15 @@ import android.net.Uri
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.content.FileProvider
+import androidx.core.content.pm.PackageInfoCompat
 import com.androgrid.v1.LastUpgradeOutcome
 import com.androgrid.v1.NodeUpgradeDirective
 import com.androgrid.v1.UpgradeNetworkPolicy
 import com.androgrid.worker.capability.RootChecker
 import com.androgrid.worker.capability.StandardRootChecker
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -145,11 +148,14 @@ class DefaultUpgradeManager(
         ledger.checkPendingUpgradeOnStartup(currentVersionProvider())
     }
 
+    private val upgradeMutex = Mutex()
+
     companion object {
         private const val TAG: String = "DefaultUpgradeManager"
         private const val BUFFER_SIZE: Int = 64 * 1024
         private const val CONNECT_TIMEOUT_MS: Int = 15_000
         private const val READ_TIMEOUT_MS: Int = 60_000
+        private val SHA256_REGEX = Regex("^[0-9a-f]{64}$")
     }
 
     override val currentVersion: String get() = currentVersionProvider().trim()
@@ -164,171 +170,220 @@ class DefaultUpgradeManager(
         directive: NodeUpgradeDirective,
         isMetered: Boolean,
         isWifi: Boolean
-    ): UpgradeOutcome = withContext(Dispatchers.IO) {
-        val targetVersion = directive.targetVersion.trim()
-        val currentVersion = currentVersionProvider().trim()
+    ): UpgradeOutcome = upgradeMutex.withLock {
+        withContext(Dispatchers.IO) {
+            val targetVersion = directive.targetVersion.trim()
+            val currentVersion = currentVersionProvider().trim()
 
-        // Step 1: Idempotency & Version Threshold Check
-        if (targetVersion.isEmpty() || targetVersion == currentVersion) {
-            Log.d(TAG, "Worker is up to date (version=$currentVersion, target=$targetVersion)")
-            return@withContext UpgradeOutcome.UpToDate(currentVersion)
-        }
-
-        // Step 2: Loop Termination Check via UpgradeLedger
-        val expectedSha256 = directive.apkSha256.trim().lowercase()
-        if (!ledger.shouldAttempt(targetVersion, expectedSha256)) {
-            val reason = "Directive for version $targetVersion (sha=$expectedSha256) is terminally rejected or currently suppressed by exponential backoff"
-            Log.w(TAG, reason)
-            return@withContext UpgradeOutcome.TerminallyRejected(reason)
-        }
-
-        // Step 3: Network Guard Enforcement per [ANTI-003], [NFR-POW-001]
-        val isCellularOrMetered = isMetered || !isWifi
-        val policy = directive.networkPolicy
-        if (isCellularOrMetered && policy != UpgradeNetworkPolicy.UPGRADE_NETWORK_POLICY_ALLOW_CELLULAR) {
-            val reason = "OTA APK download rejected: transport is metered cellular and directive policy mandates Wi-Fi only per [ANTI-003]"
-            Log.w(TAG, reason)
-            return@withContext UpgradeOutcome.NetworkPolicyViolation(reason)
-        }
-
-        // Step 4: APK URL validation
-        val apkUrl = directive.apkUrl.trim()
-        if (apkUrl.isEmpty()) {
-            val err = "OTA APK download rejected: missing or empty apk_url in directive"
-            Log.e(TAG, err)
-            ledger.recordTransientFailure(targetVersion, expectedSha256, "EMPTY_URL", err)
-            return@withContext UpgradeOutcome.DownloadFailed(err)
-        }
-
-        // Step 5: Download binary
-        val destFile = File(context.cacheDir, "androgrid_ota_${targetVersion}.apk")
-        ledger.recordAttempt(targetVersion, expectedSha256)
-
-        val downloadSuccess = try {
-            if (downloadClient != null) {
-                downloadClient.invoke(apkUrl, destFile)
-            } else {
-                downloadApkStream(apkUrl, destFile)
+            // Step 1: Idempotency & Version Threshold Check
+            if (targetVersion.isEmpty() || targetVersion == currentVersion) {
+                Log.d(TAG, "Worker is up to date (version=$currentVersion, target=$targetVersion)")
+                return@withContext UpgradeOutcome.UpToDate(currentVersion)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Download failed for $apkUrl: ${e.message}", e)
-            if (destFile.exists()) {
+
+            // Step 2: Loop Termination Check via UpgradeLedger
+            val expectedSha256 = directive.apkSha256.trim().lowercase()
+            if (!ledger.shouldAttempt(targetVersion, expectedSha256)) {
+                val reason = "Directive for version $targetVersion (sha=$expectedSha256) is terminally rejected or currently suppressed by exponential backoff"
+                Log.w(TAG, reason)
+                return@withContext UpgradeOutcome.TerminallyRejected(reason)
+            }
+
+            // Step 3: Network Guard Enforcement per [ANTI-003], [NFR-POW-001]
+            val isCellularOrMetered = isMetered || !isWifi
+            val policy = directive.networkPolicy
+            if (isCellularOrMetered && policy != UpgradeNetworkPolicy.UPGRADE_NETWORK_POLICY_ALLOW_CELLULAR) {
+                val reason = "OTA APK download rejected: transport is metered cellular and directive policy mandates Wi-Fi only per [ANTI-003]"
+                Log.w(TAG, reason)
+                return@withContext UpgradeOutcome.NetworkPolicyViolation(reason)
+            }
+
+            // Step 4: APK URL validation
+            val apkUrl = directive.apkUrl.trim()
+            if (apkUrl.isEmpty()) {
+                val err = "OTA APK download rejected: missing or empty apk_url in directive"
+                Log.e(TAG, err)
+                ledger.recordTransientFailure(targetVersion, expectedSha256, "EMPTY_URL", err)
+                return@withContext UpgradeOutcome.DownloadFailed(err)
+            }
+
+            // Step 5: Cryptographic SHA-256 Format Verification per [NFR-SEC-001]
+            if (!SHA256_REGEX.matches(expectedSha256)) {
+                val err = "OTA APK download rejected: invalid 64-hex SHA-256 hash '$expectedSha256'"
+                Log.e(TAG, err)
+                ledger.recordTerminalFailure(targetVersion, expectedSha256, "INVALID_SHA256", err)
+                return@withContext UpgradeOutcome.TerminallyRejected(err)
+            }
+
+            // Step 6: Secure Staging in cacheDir/ota
+            val otaDir = File(context.cacheDir, "ota")
+            if (!otaDir.exists()) {
+                otaDir.mkdirs()
+            }
+            val destFile = File(otaDir, "${expectedSha256}.apk")
+            val canonicalParent = destFile.canonicalFile.parentFile?.canonicalPath
+            val canonicalOtaDir = otaDir.canonicalPath
+            if (canonicalParent != canonicalOtaDir) {
+                val err = "OTA staging path traversal detected: ${destFile.absolutePath}"
+                Log.e(TAG, err)
+                ledger.recordTerminalFailure(targetVersion, expectedSha256, "PATH_TRAVERSAL", err)
+                return@withContext UpgradeOutcome.TerminallyRejected(err)
+            }
+            ledger.recordAttempt(targetVersion, expectedSha256)
+
+            val downloadSuccess = try {
+                if (downloadClient != null) {
+                    downloadClient.invoke(apkUrl, destFile)
+                } else {
+                    downloadApkStream(apkUrl, destFile)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Download failed for $apkUrl: ${e.message}", e)
+                if (destFile.exists()) {
+                    destFile.delete()
+                }
+                ledger.recordTransientFailure(targetVersion, expectedSha256, "DOWNLOAD_ERROR", e.message ?: "Unknown error")
+                return@withContext UpgradeOutcome.DownloadFailed("Download failed: ${e.message}", e)
+            }
+
+            if (!downloadSuccess || !destFile.exists() || destFile.length() == 0L) {
+                val err = "Download failed or output file is empty for $apkUrl"
+                Log.e(TAG, err)
+                if (destFile.exists()) {
+                    destFile.delete()
+                }
+                ledger.recordTransientFailure(targetVersion, expectedSha256, "EMPTY_DOWNLOAD", err)
+                return@withContext UpgradeOutcome.DownloadFailed(err)
+            }
+
+            // Step 6: Cryptographic SHA-256 Integrity Verification per [NFR-SEC-001]
+            val actualSha256 = computeFileSha256(destFile)
+            if (expectedSha256.isNotEmpty() && actualSha256 != expectedSha256) {
+                Log.e(TAG, "SHA-256 integrity verification failed: expected=$expectedSha256, actual=$actualSha256")
                 destFile.delete()
-            }
-            ledger.recordTransientFailure(targetVersion, expectedSha256, "DOWNLOAD_ERROR", e.message ?: "Unknown error")
-            return@withContext UpgradeOutcome.DownloadFailed("Download failed: ${e.message}", e)
-        }
-
-        if (!downloadSuccess || !destFile.exists() || destFile.length() == 0L) {
-            val err = "Download failed or output file is empty for $apkUrl"
-            Log.e(TAG, err)
-            if (destFile.exists()) {
-                destFile.delete()
-            }
-            ledger.recordTransientFailure(targetVersion, expectedSha256, "EMPTY_DOWNLOAD", err)
-            return@withContext UpgradeOutcome.DownloadFailed(err)
-        }
-
-        // Step 6: Cryptographic SHA-256 Integrity Verification per [NFR-SEC-001]
-        val actualSha256 = computeFileSha256(destFile)
-        if (expectedSha256.isNotEmpty() && actualSha256 != expectedSha256) {
-            Log.e(TAG, "SHA-256 integrity verification failed: expected=$expectedSha256, actual=$actualSha256")
-            destFile.delete()
-            ledger.recordTransientFailure(
-                targetVersion,
-                expectedSha256,
-                "CHECKSUM_MISMATCH",
-                "Expected $expectedSha256 but got $actualSha256"
-            )
-            return@withContext UpgradeOutcome.IntegrityVerificationFailed(
-                expectedSha256 = expectedSha256,
-                actualSha256 = actualSha256
-            )
-        }
-
-        // Step 7: Null-Safe Package Parsing & Corrupt Archive Rejection
-        val archiveInfo: PackageInfo? = try {
-            if (archiveInfoParser != null) {
-                archiveInfoParser.invoke(destFile)
-            } else {
-                context.packageManager.getPackageArchiveInfo(
-                    destFile.absolutePath,
-                    PackageManager.GET_SIGNING_CERTIFICATES
-                )
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Exception parsing APK archive info: ${e.message}", e)
-            null
-        }
-
-        if (archiveInfo == null) {
-            Log.e(TAG, "PackageManager failed to parse downloaded APK: archive corrupted or malformed")
-            destFile.delete()
-            ledger.recordTerminalFailure(
-                targetVersion,
-                expectedSha256,
-                "CORRUPT_ARCHIVE",
-                "PackageManager returned null archive info"
-            )
-            return@withContext UpgradeOutcome.IntegrityVerificationFailed(
-                expectedSha256 = expectedSha256,
-                actualSha256 = "CORRUPT_ARCHIVE"
-            )
-        }
-
-        // Step 8: Pre-Install Signing Certificate Lineage Verification per [INV-002], [NFR-SEC-001]
-        val installedSigners = getInstalledPackageSigners()
-        val archiveSigners = getArchiveSigners(archiveInfo)
-        val signaturesMatch = signatureVerifier?.invoke(installedSigners, archiveSigners)
-            ?: verifySignerLineage(installedSigners, archiveSigners)
-
-        if (!signaturesMatch) {
-            val err = "APK signing certificate mismatch: binary not signed with authorized release key"
-            Log.e(TAG, err)
-            destFile.delete()
-            ledger.recordTerminalFailure(
-                targetVersion,
-                expectedSha256,
-                "SIGNATURE_MISMATCH",
-                err
-            )
-            return@withContext UpgradeOutcome.SignatureVerificationFailed(err)
-        }
-
-        // Step 9: Heterogeneous Installation Routing
-        if (rootChecker.isDeviceRooted()) {
-            Log.i(TAG, "Device is rooted; attempting unattended package manager install (pm install -r)")
-            val (exitCode, output) = executeRootInstall(destFile, targetVersion, expectedSha256)
-            if (exitCode == 0) {
-                Log.i(TAG, "Silent root install succeeded for version $targetVersion")
-                ledger.recordSuccess(targetVersion, expectedSha256)
-                return@withContext UpgradeOutcome.InstalledRoot(exitCode, destFile)
-            }
-
-            Log.w(TAG, "Root install failed with exit code $exitCode: $output")
-            if (SharedPreferencesUpgradeLedger.isNonRetryableInstallerError(output)) {
-                ledger.recordTerminalFailure(
-                    targetVersion,
-                    expectedSha256,
-                    "INSTALL_REJECTED",
-                    output
-                )
-                destFile.delete()
-                return@withContext UpgradeOutcome.TerminallyRejected("Installation terminally failed: $output")
-            } else {
                 ledger.recordTransientFailure(
                     targetVersion,
                     expectedSha256,
-                    "INSTALL_TRANSIENT_FAILURE",
-                    output
+                    "CHECKSUM_MISMATCH",
+                    "Expected $expectedSha256 but got $actualSha256"
+                )
+                return@withContext UpgradeOutcome.IntegrityVerificationFailed(
+                    expectedSha256 = expectedSha256,
+                    actualSha256 = actualSha256
                 )
             }
-        }
 
-        // Unrooted / Consumer Hardware User Prompt
-        val installIntent = createInstallIntent(destFile)
-        Log.i(TAG, "Prepared user prompt package installation intent for version $targetVersion")
-        UpgradeOutcome.PromptUserInstall(installIntent, destFile)
+            // Step 7: Null-Safe Package Parsing & Corrupt Archive Rejection
+            val archiveInfo: PackageInfo? = try {
+                if (archiveInfoParser != null) {
+                    archiveInfoParser.invoke(destFile)
+                } else {
+                    context.packageManager.getPackageArchiveInfo(
+                        destFile.absolutePath,
+                        PackageManager.GET_SIGNING_CERTIFICATES
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Exception parsing APK archive info: ${e.message}", e)
+                null
+            }
+
+            if (archiveInfo == null) {
+                Log.e(TAG, "PackageManager failed to parse downloaded APK: archive corrupted or malformed")
+                destFile.delete()
+                ledger.recordTerminalFailure(
+                    targetVersion,
+                    expectedSha256,
+                    "CORRUPT_ARCHIVE",
+                    "PackageManager returned null archive info"
+                )
+                return@withContext UpgradeOutcome.IntegrityVerificationFailed(
+                    expectedSha256 = expectedSha256,
+                    actualSha256 = "CORRUPT_ARCHIVE"
+                )
+            }
+
+            // Step 7.1: Package Name and Monotonic Version Verification
+            if (archiveInfo.packageName.isNullOrEmpty() || archiveInfo.packageName != context.packageName) {
+                val err = "APK package name mismatch: expected ${context.packageName} but got ${archiveInfo.packageName}"
+                Log.e(TAG, err)
+                destFile.delete()
+                ledger.recordTerminalFailure(targetVersion, expectedSha256, "PACKAGE_NAME_MISMATCH", err)
+                return@withContext UpgradeOutcome.TerminallyRejected(err)
+            }
+
+            val installedPackageInfo = try {
+                context.packageManager.getPackageInfo(context.packageName, 0)
+            } catch (_: Exception) {
+                null
+            }
+            val installedVersionCode = installedPackageInfo?.let {
+                PackageInfoCompat.getLongVersionCode(it)
+            } ?: 0L
+            val archiveVersionCode = PackageInfoCompat.getLongVersionCode(archiveInfo)
+
+            if (archiveVersionCode <= installedVersionCode) {
+                val err = "APK version code downgrade or equal rejected: installed=$installedVersionCode, archive=$archiveVersionCode"
+                Log.e(TAG, err)
+                destFile.delete()
+                ledger.recordTerminalFailure(targetVersion, expectedSha256, "VERSION_CODE_DOWNGRADE", err)
+                return@withContext UpgradeOutcome.TerminallyRejected(err)
+            }
+
+            // Step 8: Pre-Install Signing Certificate Lineage Verification per [INV-002], [NFR-SEC-001]
+            val installedSigners = getInstalledPackageSigners()
+            val archiveSigners = getArchiveSigners(archiveInfo)
+            val signaturesMatch = signatureVerifier?.invoke(installedSigners, archiveSigners)
+                ?: verifySignerLineage(installedSigners, archiveSigners)
+
+            if (!signaturesMatch) {
+                val err = "APK signing certificate mismatch: binary not signed with authorized release key"
+                Log.e(TAG, err)
+                destFile.delete()
+                ledger.recordTerminalFailure(
+                    targetVersion,
+                    expectedSha256,
+                    "SIGNATURE_MISMATCH",
+                    err
+                )
+                return@withContext UpgradeOutcome.SignatureVerificationFailed(err)
+            }
+
+            // Step 9: Heterogeneous Installation Routing
+            if (rootChecker.isDeviceRooted()) {
+                Log.i(TAG, "Device is rooted; attempting unattended package manager install (pm install -r)")
+                val (exitCode, output) = executeRootInstall(destFile, targetVersion, expectedSha256)
+                if (exitCode == 0) {
+                    Log.i(TAG, "Silent root install succeeded for version $targetVersion")
+                    ledger.recordSuccess(targetVersion, expectedSha256)
+                    return@withContext UpgradeOutcome.InstalledRoot(exitCode, destFile)
+                }
+
+                Log.w(TAG, "Root install failed with exit code $exitCode: $output")
+                if (SharedPreferencesUpgradeLedger.isNonRetryableInstallerError(output)) {
+                    ledger.recordTerminalFailure(
+                        targetVersion,
+                        expectedSha256,
+                        "INSTALL_REJECTED",
+                        output
+                    )
+                    destFile.delete()
+                    return@withContext UpgradeOutcome.TerminallyRejected("Installation terminally failed: $output")
+                } else {
+                    ledger.recordTransientFailure(
+                        targetVersion,
+                        expectedSha256,
+                        "INSTALL_TRANSIENT_FAILURE",
+                        output
+                    )
+                }
+            }
+
+            // Unrooted / Consumer Hardware User Prompt
+            val installIntent = createInstallIntent(destFile)
+            Log.i(TAG, "Prepared user prompt package installation intent for version $targetVersion")
+            UpgradeOutcome.PromptUserInstall(installIntent, destFile)
+        }
     }
 
     override fun isBatteryOptimizationIgnored(): Boolean {
@@ -363,11 +418,8 @@ class DefaultUpgradeManager(
         installed: Array<Signature>?,
         archive: Array<Signature>?
     ): Boolean {
-        if (archive.isNullOrEmpty()) {
+        if (installed.isNullOrEmpty() || archive.isNullOrEmpty()) {
             return false
-        }
-        if (installed.isNullOrEmpty()) {
-            return true
         }
         val installedDigests = installed.map { computeCertSha256(it) }.toSet()
         val archiveDigests = archive.map { computeCertSha256(it) }.toSet()
