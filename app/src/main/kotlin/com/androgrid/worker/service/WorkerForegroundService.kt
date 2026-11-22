@@ -43,6 +43,7 @@ import com.androgrid.worker.telemetry.SharedPreferencesTaskLedgerRepository
 import com.androgrid.worker.telemetry.TaskLedgerEntry
 import com.androgrid.worker.telemetry.TaskLedgerRepository
 import com.androgrid.worker.telemetry.TaskLedgerStatus
+import com.androgrid.worker.upgrade.UpgradeOutcome
 import com.androgrid.worker.telemetry.ThermalSafetyGuard
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -334,7 +335,10 @@ class WorkerForegroundService : Service() {
                                     lifecycleManager.releaseGeneration(genAlias)
                                 }
                             },
-                            upgradeManager = app?.upgradeManager
+                            upgradeManager = app?.upgradeManager,
+                            onPromptUserInstall = { intent ->
+                                startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                            }
                         )
 
                         // Step 2: 2.0-second declarative synchronization loop per [REQ-OP-002]
@@ -352,8 +356,9 @@ class WorkerForegroundService : Service() {
                                 .setNodeId(nodeId)
                                 .setSessionToken(sessionToken)
                                 .addAllCompletedTasks(reportsToSend)
-                            app?.upgradeManager?.getLastOutcome()?.let { outcome ->
-                                syncBuilder.setLastUpgradeOutcome(outcome)
+                            val sentOutcome = app?.upgradeManager?.getLastOutcome()
+                            if (sentOutcome != null) {
+                                syncBuilder.setLastUpgradeOutcome(sentOutcome)
                             }
                             val syncRequest = syncBuilder.build()
 
@@ -425,8 +430,10 @@ class WorkerForegroundService : Service() {
                             if (effectiveSyncResult.isSuccess) {
                                 val response = effectiveSyncResult.getOrNull()
                                 if (response != null) {
+                                    if (sentOutcome != null) {
+                                        app?.upgradeManager?.clearLastOutcome()
+                                    }
                                     taskProcessor.applySyncResponse(this, response, isThrottled)
-                                    app?.upgradeManager?.clearLastOutcome()
                                 }
                             }
 
@@ -514,7 +521,8 @@ internal class WifiSyncTaskProcessor(
     private val activeJobs: ConcurrentHashMap<String, Job> = ConcurrentHashMap(),
     private val blobFetcher: (suspend (String) -> ByteArray)? = null,
     private val fetchArtifactRpc: (suspend (FetchArtifactRequest) -> FetchArtifactResponse)? = null,
-    private val upgradeManager: com.androgrid.worker.upgrade.UpgradeManager? = null
+    private val upgradeManager: com.androgrid.worker.upgrade.UpgradeManager? = null,
+    private val onPromptUserInstall: ((Intent) -> Unit)? = null
 ) {
     private val isDrainingForUpgrade = java.util.concurrent.atomic.AtomicBoolean(false)
 
@@ -558,25 +566,33 @@ internal class WifiSyncTaskProcessor(
             if (isDrainingForUpgrade.compareAndSet(false, true)) {
                 scope.launch {
                     try {
-                        while (activeJobs.isNotEmpty()) {
+                        while (activeJobs.isNotEmpty() || completedReports.isNotEmpty()) {
                             delay(100L)
                         }
-                        upgradeManager?.processUpgradeDirective(
+                        val outcome = upgradeManager?.processUpgradeDirective(
                             directive = directive,
                             isMetered = false,
                             isWifi = true
                         )
+                        if (outcome is UpgradeOutcome.PromptUserInstall) {
+                            onPromptUserInstall?.invoke(outcome.intent)
+                        }
                     } finally {
                         isDrainingForUpgrade.set(false)
                     }
                 }
             }
         } else if (directive != null) {
-            upgradeManager?.processUpgradeDirective(
-                directive = directive,
-                isMetered = false,
-                isWifi = true
-            )
+            scope.launch {
+                val outcome = upgradeManager?.processUpgradeDirective(
+                    directive = directive,
+                    isMetered = false,
+                    isWifi = true
+                )
+                if (outcome is UpgradeOutcome.PromptUserInstall) {
+                    onPromptUserInstall?.invoke(outcome.intent)
+                }
+            }
         }
 
         if (!isThrottled && !isDrainingForUpgrade.get() && !shouldDrain) {

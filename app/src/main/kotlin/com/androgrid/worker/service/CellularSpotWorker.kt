@@ -98,6 +98,7 @@ class CellularSpotWorkerLogic(
         }
 
         // Step 3 & 4: Use pre-claimed outcome if provided, else build and send claim request
+        var sentOutcome: com.androgrid.v1.LastUpgradeOutcome? = null
         val claimOutcome = preClaimedOutcome ?: run {
             val capabilities = capabilityProvider.buildCapabilities(
                 currentTransport = NetworkTransportType.NETWORK_TRANSPORT_CELLULAR_WAN,
@@ -116,8 +117,9 @@ class CellularSpotWorkerLogic(
                 .setBatteryTemperatureCelsius(battery.temperatureCelsius)
                 .setThermalStatus(thermalStatus)
                 .setClientVersion(clientVersion)
-            upgradeManager?.getLastOutcome()?.let { outcome ->
-                claimRequestBuilder.setLastUpgradeOutcome(outcome)
+            sentOutcome = upgradeManager?.getLastOutcome()
+            if (sentOutcome != null) {
+                claimRequestBuilder.setLastUpgradeOutcome(sentOutcome)
             }
             val claimRequest = claimRequestBuilder.build()
 
@@ -131,11 +133,15 @@ class CellularSpotWorkerLogic(
 
         val (task, pendingUpgradeDirective) = when (claimOutcome) {
             is CellularClaimOutcome.NoTask -> {
-                upgradeManager?.clearLastOutcome()
+                if (sentOutcome != null) {
+                    upgradeManager?.clearLastOutcome()
+                }
                 return androidx.work.ListenableWorker.Result.success()
             }
             is CellularClaimOutcome.UpgradeAvailable -> {
-                upgradeManager?.clearLastOutcome()
+                if (sentOutcome != null) {
+                    upgradeManager?.clearLastOutcome()
+                }
                 handleCellularUpgradeDirective(claimOutcome.directive)
                 return androidx.work.ListenableWorker.Result.success()
             }
@@ -167,7 +173,9 @@ class CellularSpotWorkerLogic(
                 return androidx.work.ListenableWorker.Result.success()
             }
             is CellularClaimOutcome.TaskReady -> {
-                upgradeManager?.clearLastOutcome()
+                if (sentOutcome != null) {
+                    upgradeManager?.clearLastOutcome()
+                }
                 Pair(claimOutcome.task, claimOutcome.upgradeDirective)
             }
         }
