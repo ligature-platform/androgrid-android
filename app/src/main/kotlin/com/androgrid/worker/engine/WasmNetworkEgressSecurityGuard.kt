@@ -57,6 +57,8 @@ class WasmNetworkEgressSecurityGuard(
             "co.za", "de", "fr", "nl", "ru", "cn", "in", "uk", "au", "ca", "jp", "eu",
             "ai", "app", "dev", "xyz", "cloud", "workers.dev", "amazonaws.com", "github.io"
         )
+
+        val IPV4_LITERAL_REGEX: Regex = Regex("^(\\d{1,3}\\.){3}\\d{1,3}$")
     }
 
     /**
@@ -97,6 +99,15 @@ class WasmNetworkEgressSecurityGuard(
 
             // RFC 6598 Carrier-Grade NAT (100.64.0.0/10)
             if (b0 == 100 && b1 in 64..127) return true
+
+            // RFC 6890 / RFC 5736 IETF Protocol Assignments (192.0.0.0/24)
+            val b2 = raw[2].toInt() and 0xFF
+            if (b0 == 192 && b1 == 0 && b2 == 0) return true
+
+            // RFC 5737 Documentation (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)
+            if (b0 == 192 && b1 == 0 && b2 == 2) return true
+            if (b0 == 198 && b1 == 51 && b2 == 100) return true
+            if (b0 == 203 && b1 == 0 && b2 == 113) return true
 
             // RFC 2544 Benchmark Testing (198.18.0.0/15)
             if (b0 == 198 && b1 in 18..19) return true
@@ -139,6 +150,19 @@ class WasmNetworkEgressSecurityGuard(
 
             // Loopback (::1)
             if (raw.take(15).all { it == 0.toByte() } && raw[15] == 1.toByte()) return true
+
+            // IPv4-Compatible IPv6 (::/96, RFC 4291)
+            val isIpv4Compat = raw.take(12).all { it == 0.toByte() } &&
+                    !raw.take(15).all { it == 0.toByte() }
+            if (isIpv4Compat) {
+                val ipv4Bytes = ByteArray(4) { i -> raw[12 + i] }
+                val mappedAddr = try {
+                    InetAddress.getByAddress(ipv4Bytes)
+                } catch (e: Exception) {
+                    return true
+                }
+                return isDisallowedAddress(mappedAddr)
+            }
 
             // NAT64 Well-Known Prefix (64:ff9b::/96)
             val isNat64WellKnown = raw[0] == 0x00.toByte() && raw[1] == 0x64.toByte() &&
@@ -209,7 +233,8 @@ class WasmNetworkEgressSecurityGuard(
                 return false
             }
             // Must not target public suffix
-            if (FORBIDDEN_WILDCARD_SUFFIXES.contains(suffix)) {
+            val parsedSuffixUrl = "https://$suffix".toHttpUrlOrNull()
+            if (parsedSuffixUrl?.topPrivateDomain() == null || FORBIDDEN_WILDCARD_SUFFIXES.contains(suffix)) {
                 return false
             }
             // Apex domain must NOT match the wildcard pattern
@@ -335,9 +360,9 @@ class WasmNetworkEgressSecurityGuard(
         }
 
         // Step 2: Enforce fail-closed quota check
-        if (maxEgressBytes <= 0) {
+        if (maxEgressBytes <= 0 || maxEgressBytes > WasmNetworkEgressHostModule.MAX_TASK_EGRESS_BYTES) {
             throw SecurityException(
-                "max_egress_bytes must be greater than zero when egress_policy is ALLOWLIST (fail-closed default)"
+                "max_egress_bytes must be between 1 and ${WasmNetworkEgressHostModule.MAX_TASK_EGRESS_BYTES} bytes (fail-closed default)"
             )
         }
 
@@ -393,7 +418,7 @@ class WasmNetworkEgressSecurityGuard(
         }
 
         // Step 6: If host is an IP literal, enforce SSRF guard upfront
-        val isIpLiteral = host.matches(Regex("^(\\d{1,3}\\.){3}\\d{1,3}$")) || host.contains(':')
+        val isIpLiteral = host.matches(IPV4_LITERAL_REGEX) || host.contains(':')
         if (isIpLiteral) {
             val literalAddr = try {
                 InetAddress.getByName(host)

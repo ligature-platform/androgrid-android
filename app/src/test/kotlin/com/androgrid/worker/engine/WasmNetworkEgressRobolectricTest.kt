@@ -344,7 +344,6 @@ class WasmNetworkEgressRobolectricTest {
             .setTimeoutSeconds(15)
             .putEnvVars("TARGET_URL", targetUrl)
             .putEnvVars("METHOD", "GET")
-            .putEnvVars("CONCURRENCY", "2")
             .putEnvVars("DURATION_SECS", "5")
             .putEnvVars("MAX_REQUESTS", "3")
             .setWasmBytecode(ByteString.copyFrom(wasmBytes))
@@ -458,6 +457,13 @@ class WasmNetworkEgressRobolectricTest {
         assertThat(guard.isDisallowedAddress(nat64LocalUse)).isTrue()
         assertThat(guard.isDisallowedAddress(sixToFour)).isTrue()
         assertThat(guard.isDisallowedAddress(teredo)).isTrue()
+
+        // RFC 6890 / 5736 / 5737 and IPv4-compatible IPv6
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("192.0.0.1"))).isTrue()
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("192.0.2.1"))).isTrue()
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("198.51.100.1"))).isTrue()
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("203.0.113.1"))).isTrue()
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("::192.168.1.1"))).isTrue()
     }
 
     @Test
@@ -470,6 +476,9 @@ class WasmNetworkEgressRobolectricTest {
 
         // Wildcard must NOT match apex domain
         assertThat(guard.matchesHostnamePattern("example.com", "*.example.com")).isFalse()
+
+        // Public suffix wildcards forbidden via topPrivateDomain()
+        assertThat(guard.matchesHostnamePattern("co.uk", "*.co.uk")).isFalse()
 
         // Wildcard matches subdomains
         assertThat(guard.matchesHostnamePattern("api.example.com", "*.example.com")).isTrue()
@@ -492,7 +501,18 @@ class WasmNetworkEgressRobolectricTest {
                 maxEgressBytes = 0
             )
         }
-        assertThat(exZeroQuota.message).contains("max_egress_bytes must be greater than zero")
+        assertThat(exZeroQuota.message).contains("max_egress_bytes must be between 1 and")
+
+        // max_egress_bytes > 64 MB must be rejected
+        val exOverQuota = assertThrows(SecurityException::class.java) {
+            guard.validateOutboundUrl(
+                urlString = "https://api.example.com/data",
+                policy = NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST,
+                allowedHostnames = listOf("api.example.com"),
+                maxEgressBytes = 65L * 1024 * 1024
+            )
+        }
+        assertThat(exOverQuota.message).contains("max_egress_bytes must be between 1 and")
 
         // Metered provider true must be rejected
         val exMetered = assertThrows(SecurityException::class.java) {

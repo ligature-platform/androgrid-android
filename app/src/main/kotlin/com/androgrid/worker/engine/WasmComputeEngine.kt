@@ -17,6 +17,7 @@ import com.google.protobuf.ByteString
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
@@ -54,6 +55,7 @@ class WasmComputeEngine(
         okHttpClient?.let { return it }
         return lazyOwnedClient ?: synchronized(this) {
             lazyOwnedClient ?: okhttp3.OkHttpClient.Builder()
+                .proxy(java.net.Proxy.NO_PROXY)
                 .dns(dns)
                 .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
                 .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
@@ -192,6 +194,7 @@ class WasmComputeEngine(
      * @param executionJob active coroutine job used to signal cooperative cancellation.
      * @return TaskExecutionResult with captured stdout, stderr, and exit status.
      */
+    @OptIn(InternalCoroutinesApi::class)
     private fun executeWasmInMemory(
         task: TaskSpec,
         bytecode: ByteString,
@@ -260,7 +263,7 @@ class WasmComputeEngine(
         val cancelled = AtomicBoolean(false)
         val workerThread = AtomicReference<Thread?>(null)
         val interruptLock = Any()
-        val completionHandle = executionJob?.invokeOnCompletion { cause ->
+        val completionHandle = executionJob?.invokeOnCompletion(onCancelling = true) { cause ->
             if (cause != null) {
                 synchronized(interruptLock) {
                     cancelled.set(true)

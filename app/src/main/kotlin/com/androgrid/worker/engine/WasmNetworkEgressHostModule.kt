@@ -46,6 +46,7 @@ class WasmNetworkEgressHostModule(
 
     // Derive a per-task child client with in-socket Dns and disabled redirects
     private val taskClient: OkHttpClient = okHttpClient.newBuilder()
+        .proxy(java.net.Proxy.NO_PROXY)
         .dns(securityGuard.createTaskDns())
         .followRedirects(false)
         .followSslRedirects(false)
@@ -60,6 +61,9 @@ class WasmNetworkEgressHostModule(
 
     companion object {
         const val MODULE_NAME = "androgrid_net"
+
+        // Maximum cumulative egress quota per task attempt (64 MB)
+        const val MAX_TASK_EGRESS_BYTES: Long = 64L * 1024 * 1024
 
         // Fixed negative error code return enum per ADR-011
         const val ERR_IO_FAILURE = -1
@@ -115,38 +119,7 @@ class WasmNetworkEgressHostModule(
             longArrayOf(result.toLong())
         }
 
-        val httpGet = HostFunction(
-            MODULE_NAME,
-            "http_get",
-            FunctionType.of(
-                listOf(
-                    ValType.I32, // 0: url_ptr
-                    ValType.I32, // 1: url_len
-                    ValType.I32, // 2: out_buf_ptr
-                    ValType.I32, // 3: out_buf_cap
-                    ValType.I32  // 4: out_written_ptr
-                ),
-                listOf(ValType.I32) // return status code
-            )
-        ) { instance, args ->
-            val result = executeHttpFetch(
-                instance = instance,
-                urlPtr = args[0].toInt(),
-                urlLen = args[1].toInt(),
-                methodPtr = 0,
-                methodLen = 0,
-                headersPtr = 0,
-                headersLen = 0,
-                bodyPtr = 0,
-                bodyLen = 0,
-                outBufPtr = args[2].toInt(),
-                outBufCap = args[3].toInt(),
-                outWrittenPtr = args[4].toInt()
-            )
-            longArrayOf(result.toLong())
-        }
-
-        return arrayOf(httpFetch, httpGet)
+        return arrayOf(httpFetch)
     }
 
     /**
@@ -179,9 +152,17 @@ class WasmNetworkEgressHostModule(
         val memory = instance.memory()
         val maxQuota = task.maxEgressBytes
 
-        // Fail-closed quota guard per ADR-011: max_egress_bytes must be > 0
-        if (maxQuota <= 0) {
+        // Fail-closed quota guard per ADR-011: max_egress_bytes must be > 0 and <= MAX_TASK_EGRESS_BYTES
+        if (maxQuota <= 0 || maxQuota > MAX_TASK_EGRESS_BYTES) {
             return ERR_QUOTA_EXCEEDED
+        }
+
+        // Linear memory bounds pre-validation
+        val memorySizeBytes = memory.pages().toLong() * 65536L
+        if (outBufPtr.toLong() + outBufCap.toLong() > memorySizeBytes ||
+            outWrittenPtr.toLong() + 4L > memorySizeBytes
+        ) {
+            return ERR_SECURITY_VIOLATION
         }
 
         // 1. Read and validate destination URL from WASM linear memory
@@ -266,8 +247,10 @@ class WasmNetworkEgressHostModule(
         cumulativeBytesTransferred.addAndGet(totalOutboundBytes)
 
         val callRef = AtomicReference<Call?>(null)
+        val cancelledByJob = java.util.concurrent.atomic.AtomicBoolean(false)
         val completionHandle = executionJob?.invokeOnCompletion(onCancelling = true) { cause ->
             if (cause != null) {
+                cancelledByJob.set(true)
                 callRef.get()?.cancel()
             }
         }
@@ -320,32 +303,33 @@ class WasmNetworkEgressHostModule(
                     }
 
                 val source = responseBody.source()
-                val chunkBuffer = Buffer()
+                val tempBuffer = ByteArray(STREAM_CHUNK_SIZE.toInt())
                 var totalBytesRead = 0
 
                 // 8. Stream response body in bounded chunks directly into WASM linear memory
                 while (true) {
-                    val readCount = source.read(chunkBuffer, STREAM_CHUNK_SIZE)
-                    if (readCount == -1L) {
+                    val readCount = source.read(tempBuffer)
+                    if (readCount == -1) {
                         break
                     }
 
-                    val chunkBytes = chunkBuffer.readByteArray()
-
-                    // Assert out_buf_cap bounds without silent truncation
-                    if (totalBytesRead + chunkBytes.size > outBufCap) {
-                        call.cancel()
-                        return ERR_BUFFER_TOO_SMALL
-                    }
+                    // Bill transferred bytes immediately upon read
+                    cumulativeBytesTransferred.addAndGet(readCount.toLong())
 
                     // Assert cumulative quota limits
-                    if (cumulativeBytesTransferred.get() + chunkBytes.size > maxQuota) {
+                    if (cumulativeBytesTransferred.get() > maxQuota) {
                         call.cancel()
                         return ERR_QUOTA_EXCEEDED
                     }
 
+                    // Assert out_buf_cap bounds without silent truncation
+                    if (totalBytesRead + readCount > outBufCap) {
+                        call.cancel()
+                        return ERR_BUFFER_TOO_SMALL
+                    }
+
                     // Assert 16 MB frame limit [NFR-PERF-001]
-                    if (totalBytesRead + chunkBytes.size > WasmComputeEngine.MAX_FRAME_SIZE_BYTES) {
+                    if (totalBytesRead + readCount > WasmComputeEngine.MAX_FRAME_SIZE_BYTES) {
                         call.cancel()
                         return ERR_SECURITY_VIOLATION
                     }
@@ -353,15 +337,14 @@ class WasmNetworkEgressHostModule(
                     // Write chunk into linear memory
                     if (outBufCap > 0) {
                         try {
-                            memory.write(outBufPtr + totalBytesRead, chunkBytes, 0, chunkBytes.size)
+                            memory.write(outBufPtr + totalBytesRead, tempBuffer, 0, readCount)
                         } catch (e: Exception) {
                             call.cancel()
                             return ERR_SECURITY_VIOLATION
                         }
                     }
 
-                    totalBytesRead += chunkBytes.size
-                    cumulativeBytesTransferred.addAndGet(chunkBytes.size.toLong())
+                    totalBytesRead += readCount
                 }
 
                 // Write exact byte count to out_written_ptr if non-negative
@@ -380,8 +363,8 @@ class WasmNetworkEgressHostModule(
         } catch (e: SecurityException) {
             ERR_SECURITY_VIOLATION
         } catch (e: IOException) {
-            if (callRef.get()?.isCanceled() == true || executionJob?.isActive == false) {
-                throw CancellationException("WASM outbound network request cancelled", e)
+            if (cancelledByJob.get() || executionJob?.isActive == false) {
+                throw CancellationException("WASM outbound network request cancelled by job", e)
             }
             ERR_IO_FAILURE
         } catch (e: CancellationException) {
