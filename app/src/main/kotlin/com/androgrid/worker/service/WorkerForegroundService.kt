@@ -32,9 +32,11 @@ import com.androgrid.worker.enrollment.AndroidKeyStoreEnrollmentProvider
 import com.androgrid.worker.enrollment.CredentialLifecycleManager
 import com.androgrid.worker.enrollment.RenewalOutcome
 import com.androgrid.worker.engine.TaskExecutionDispatcher
+import com.androgrid.worker.engine.WasmComputeEngine
 import com.androgrid.worker.network.ArtifactResolution
 import com.androgrid.worker.network.ArtifactResolver
 import com.androgrid.worker.network.DefaultMtlsSocketFactoryProvider
+import com.androgrid.worker.network.NetworkRoute
 import com.androgrid.worker.network.OkHttpBlobFetcher
 import com.androgrid.worker.network.SharedPreferencesClusterSettingsRepository
 import com.androgrid.worker.network.WifiSyncClient
@@ -189,8 +191,15 @@ class WorkerForegroundService : Service() {
             val rootChecker = StandardRootChecker()
             val systemInfo = AndroidSystemInfoProvider(applicationContext)
             val capabilityProvider = DeviceCapabilityProvider(rootChecker, systemInfo)
-            val dispatcher = TaskExecutionDispatcher()
-            val app = application as? AndroGridApplication
+            val wasmEngine = WasmComputeEngine(
+                isMeteredProvider = {
+                    val route = (application as? AndroGridApplication)?.networkRouteMonitor?.currentRoute?.value
+                    !(route is NetworkRoute.LanConnected && !route.isMetered)
+                }
+            )
+            val dispatcher = TaskExecutionDispatcher(wasmEngine = wasmEngine)
+            try {
+                val app = application as? AndroGridApplication
             val settingsRepo = app?.settingsRepository
                 ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
             val lifecycleManager = app?.credentialLifecycleManager
@@ -450,6 +459,9 @@ class WorkerForegroundService : Service() {
                         }
                     }
                 }
+            } finally {
+                dispatcher.close()
+            }
         }
     }
 

@@ -13,7 +13,11 @@ class TaskExecutionDispatcher(
     private val wasmEngine: ComputeEngine = WasmComputeEngine(),
     private val toyboxEngine: ComputeEngine = ToyboxUserEngine(),
     private val rootShellEngine: ComputeEngine = RootShellEngine()
-) {
+) : AutoCloseable {
+
+    override fun close() {
+        (wasmEngine as? AutoCloseable)?.close()
+    }
 
     /**
      * Dispatches task to designated engine and measures execution duration.
