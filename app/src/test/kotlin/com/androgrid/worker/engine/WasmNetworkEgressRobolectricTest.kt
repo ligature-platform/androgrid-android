@@ -292,6 +292,71 @@ class WasmNetworkEgressRobolectricTest {
     }
 
     @Test
+    fun testDistributedHttpBenchmarkWorkload_executesInChicoryWasiSandbox(): Unit = runBlocking {
+        val candidates = listOf(
+            java.io.File("../androgrid-backend/workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm"),
+            java.io.File("../../androgrid-backend/workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm"),
+            java.io.File("../androgrid-backend/tests/fixtures/wasm/http_benchmark.wasm"),
+            java.io.File("../../androgrid-backend/tests/fixtures/wasm/http_benchmark.wasm")
+        )
+        val wasmFile = candidates.firstOrNull { it.exists() }
+        assertThat(wasmFile).isNotNull()
+        val wasmBytes = wasmFile!!.readBytes()
+
+        mockServer.start()
+        val port = mockServer.port
+        for (i in 1..5) {
+            mockServer.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setHeader("Content-Type", "application/json")
+                    .setBody("""{"status":"ok","iteration":$i}""")
+            )
+        }
+
+        val targetUrl = "http://api.edge-compute.org:$port/benchmark"
+        val mockDns = object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> {
+                return if (hostname == "api.edge-compute.org") {
+                    listOf(InetAddress.getByName("127.0.0.1"))
+                } else {
+                    listOf(InetAddress.getByName("93.184.216.34"))
+                }
+            }
+        }
+
+        val engine = WasmComputeEngine(
+            dns = mockDns,
+            isMeteredProvider = { false },
+            allowLoopbackForTesting = true
+        )
+
+        val task = TaskSpec.newBuilder()
+            .setTaskId("task_http_bench_001")
+            .setEngine(ExecutionEngine.EXECUTION_ENGINE_WASM_WASI)
+            .setEgressPolicy(NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST)
+            .addAllowedHostnames("api.edge-compute.org")
+            .setMaxEgressBytes(2097152)
+            .setTimeoutSeconds(15)
+            .putEnvVars("TARGET_URL", targetUrl)
+            .putEnvVars("METHOD", "GET")
+            .putEnvVars("CONCURRENCY", "2")
+            .putEnvVars("DURATION_SECS", "5")
+            .putEnvVars("MAX_REQUESTS", "3")
+            .setWasmBytecode(ByteString.copyFrom(wasmBytes))
+            .build()
+
+        val result = engine.execute(task)
+
+        assertThat(result.isSuccess).isTrue()
+        assertThat(result.exitCode).isEqualTo(0)
+        val stdout = String(result.stdoutBytes, Charsets.UTF_8)
+        assertThat(stdout).contains("AndroGrid Distributed HTTP Benchmark")
+        assertThat(stdout).contains("JSON Report:")
+        assertThat(stdout).contains(""""total_requests": 3""")
+    }
+
+    @Test
     fun testDeterministicRejection_toctouDnsRebindingAtConnectionTime() {
         val guard = WasmNetworkEgressSecurityGuard(allowLoopbackForTesting = false)
 
