@@ -15,8 +15,8 @@ android {
         applicationId = "com.androgrid.worker"
         minSdk = 28
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.0.1-alpha.4"
+        versionCode = 5
+        versionName = "0.0.1-alpha.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

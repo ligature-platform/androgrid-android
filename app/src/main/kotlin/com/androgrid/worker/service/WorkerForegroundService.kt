@@ -288,9 +288,9 @@ class WorkerForegroundService : Service() {
 
                         val clientVersion = try {
                             val pkgInfo = packageManager.getPackageInfo(packageName, 0)
-                            pkgInfo.versionName ?: "0.0.1-alpha.4"
+                            pkgInfo.versionName ?: "0.0.1-alpha.5"
                         } catch (_: Exception) {
-                            "0.0.1-alpha.4"
+                            "0.0.1-alpha.5"
                         }
 
                         // Step 1: Register node per [REQ-OP-001] with exponential backoff retry loop
