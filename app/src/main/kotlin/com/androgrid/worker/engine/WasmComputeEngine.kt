@@ -47,24 +47,26 @@ class WasmComputeEngine(
     private val allowLoopbackForTesting: Boolean = false
 ) : ComputeEngine, AutoCloseable {
 
-    private val ownedOkHttpClient: okhttp3.OkHttpClient? = if (okHttpClient == null) {
-        okhttp3.OkHttpClient.Builder()
-            .dns(dns)
-            .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-            .writeTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-            .followRedirects(false)
-            .followSslRedirects(false)
-            .connectionPool(okhttp3.ConnectionPool(4, 15, java.util.concurrent.TimeUnit.SECONDS))
-            .build()
-    } else {
-        null
+    @Volatile
+    private var lazyOwnedClient: okhttp3.OkHttpClient? = null
+
+    private fun getEffectiveBaseClient(): okhttp3.OkHttpClient {
+        okHttpClient?.let { return it }
+        return lazyOwnedClient ?: synchronized(this) {
+            lazyOwnedClient ?: okhttp3.OkHttpClient.Builder()
+                .dns(dns)
+                .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                .followRedirects(false)
+                .followSslRedirects(false)
+                .connectionPool(okhttp3.ConnectionPool(4, 15, java.util.concurrent.TimeUnit.SECONDS))
+                .build().also { lazyOwnedClient = it }
+        }
     }
 
-    private val effectiveBaseClient: okhttp3.OkHttpClient = okHttpClient ?: ownedOkHttpClient!!
-
     override fun close() {
-        ownedOkHttpClient?.let { client ->
+        lazyOwnedClient?.let { client ->
             client.dispatcher.executorService.shutdownNow()
             client.connectionPool.evictAll()
         }
@@ -226,7 +228,7 @@ class WasmComputeEngine(
             val egressModule = WasmNetworkEgressHostModule(
                 task = task,
                 securityGuard = securityGuard,
-                okHttpClient = effectiveBaseClient,
+                okHttpClient = getEffectiveBaseClient(),
                 executionJob = executionJob
             )
             hostFunctions.addAll(egressModule.toHostFunctions())

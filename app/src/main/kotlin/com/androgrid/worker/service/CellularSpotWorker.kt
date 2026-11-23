@@ -62,7 +62,11 @@ class CellularSpotWorkerLogic(
     private val ledgerRepository: TaskLedgerRepository? = null,
     private val upgradeManager: UpgradeManager? = null,
     private val downloadScheduler: ((NodeUpgradeDirective) -> Unit)? = null
-) {
+) : AutoCloseable {
+    override fun close() {
+        dispatcher.close()
+    }
+
     private suspend fun handleCellularUpgradeDirective(directive: NodeUpgradeDirective) {
         if (directive.networkPolicy == com.androgrid.v1.UpgradeNetworkPolicy.UPGRADE_NETWORK_POLICY_ALLOW_CELLULAR) {
             if (downloadScheduler != null) {
@@ -355,8 +359,12 @@ class CellularSpotWorker(
                 }
             )
 
-            val preClaimed = (renewalOutcome as? RenewalOutcome.Renewed<*>)?.trialResult as? CellularClaimOutcome
-            return workerLogic.executeSpotTask(preClaimed)
+            try {
+                val preClaimed = (renewalOutcome as? RenewalOutcome.Renewed<*>)?.trialResult as? CellularClaimOutcome
+                return workerLogic.executeSpotTask(preClaimed)
+            } finally {
+                workerLogic.close()
+            }
         } finally {
             thermalListener.stopListening()
             lifecycleManager.releaseGeneration(activeAlias)

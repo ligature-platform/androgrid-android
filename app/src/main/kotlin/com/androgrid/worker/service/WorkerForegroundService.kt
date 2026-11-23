@@ -8,6 +8,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -193,8 +195,21 @@ class WorkerForegroundService : Service() {
             val capabilityProvider = DeviceCapabilityProvider(rootChecker, systemInfo)
             val wasmEngine = WasmComputeEngine(
                 isMeteredProvider = {
-                    val route = (application as? AndroGridApplication)?.networkRouteMonitor?.currentRoute?.value
-                    !(route is NetworkRoute.LanConnected && !route.isMetered)
+                    val app = application as? AndroGridApplication
+                    val monitor = app?.networkRouteMonitor
+                    val route = monitor?.currentRoute?.value
+                    if (route is NetworkRoute.LanConnected) {
+                        route.isMetered
+                    } else {
+                        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                        val activeNet = cm?.activeNetwork
+                        val caps = cm?.getNetworkCapabilities(activeNet)
+                        if (caps != null && (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))) {
+                            !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                        } else {
+                            true
+                        }
+                    }
                 }
             )
             val dispatcher = TaskExecutionDispatcher(wasmEngine = wasmEngine)
