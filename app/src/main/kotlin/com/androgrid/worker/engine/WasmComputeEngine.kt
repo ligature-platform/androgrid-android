@@ -42,10 +42,33 @@ class WasmComputeEngine(
     private val computeDispatcher: CoroutineDispatcher = Dispatchers.Default,
     private val okHttpClient: okhttp3.OkHttpClient? = null,
     private val dns: okhttp3.Dns = okhttp3.Dns.SYSTEM,
-    private val isMeteredProvider: () -> Boolean = { false },
+    private val isMeteredProvider: () -> Boolean = { true },
     private val propagateSecurityExceptions: Boolean = false,
     private val allowLoopbackForTesting: Boolean = false
-) : ComputeEngine {
+) : ComputeEngine, AutoCloseable {
+
+    private val ownedOkHttpClient: okhttp3.OkHttpClient? = if (okHttpClient == null) {
+        okhttp3.OkHttpClient.Builder()
+            .dns(dns)
+            .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .writeTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .connectionPool(okhttp3.ConnectionPool(4, 15, java.util.concurrent.TimeUnit.SECONDS))
+            .build()
+    } else {
+        null
+    }
+
+    private val effectiveBaseClient: okhttp3.OkHttpClient = okHttpClient ?: ownedOkHttpClient!!
+
+    override fun close() {
+        ownedOkHttpClient?.let { client ->
+            client.dispatcher.executorService.shutdown()
+            client.connectionPool.evictAll()
+        }
+    }
 
     private class WasmCancelledTrap : RuntimeException("WASM execution cancelled")
 
@@ -190,12 +213,6 @@ class WasmComputeEngine(
             .withOptions(wasiOptions)
             .build()
 
-        val effectiveOkHttpClient = okHttpClient ?: okhttp3.OkHttpClient.Builder()
-            .dns(dns)
-            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-            .build()
-
         val securityGuard = WasmNetworkEgressSecurityGuard(
             dns = dns,
             isMeteredProvider = isMeteredProvider,
@@ -205,7 +222,7 @@ class WasmComputeEngine(
         val egressModule = WasmNetworkEgressHostModule(
             task = task,
             securityGuard = securityGuard,
-            okHttpClient = effectiveOkHttpClient,
+            okHttpClient = effectiveBaseClient,
             executionJob = executionJob
         )
 

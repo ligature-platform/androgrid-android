@@ -12,6 +12,7 @@ import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.Buffer
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -21,14 +22,16 @@ import java.util.concurrent.atomic.AtomicReference
  * into the in-memory Chicory WebAssembly runtime environment.
  *
  * Exposes:
- * - `androgrid_net:http_fetch(url_ptr, url_len, method_ptr, method_len, body_ptr, body_len, out_buf_ptr, out_buf_cap, out_written_ptr) -> i32`
+ * - `androgrid_net:http_fetch(url_ptr, url_len, method_ptr, method_len, headers_ptr, headers_len, body_ptr, body_len, out_buf_ptr, out_buf_cap, out_written_ptr) -> i32`
  * - `androgrid_net:http_get(url_ptr, url_len, out_buf_ptr, out_buf_cap, out_written_ptr) -> i32`
  *
  * Enforces:
- * 1. Allowlist and SSRF verification via [WasmNetworkEgressSecurityGuard].
+ * 1. Allowlist, DNS TOCTOU, and SSRF verification via [WasmNetworkEgressSecurityGuard].
  * 2. Cumulative egress transfer quotas ([TaskSpec.getMaxEgressBytes]).
  * 3. 16 MB maximum message frame limits ([NFR-PERF-001]).
- * 4. Structured cooperative coroutine cancellation hooks to prevent worker thread hanging.
+ * 4. Okio bounded chunk streaming to prevent JVM heap exhaustion without silent truncation.
+ * 5. Structured cooperative coroutine cancellation hooks to prevent worker thread hanging.
+ * 6. Standardized ABI: returns HTTP status code (>= 100) on success, or fixed negative error codes.
  *
  * Traces to: [INV-001], [INV-003], [INV-006], [ANTI-003], [NFR-SEC-001], [NFR-POW-001], [NFR-PERF-001], ADR-011
  */
@@ -41,11 +44,23 @@ class WasmNetworkEgressHostModule(
 
     private val cumulativeBytesTransferred = AtomicLong(0L)
 
+    // Derive a per-task child client with in-socket Dns and disabled redirects
+    private val taskClient: OkHttpClient = okHttpClient.newBuilder()
+        .dns(securityGuard.createTaskDns())
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
+
     companion object {
         const val MODULE_NAME = "androgrid_net"
+
+        // Fixed negative error code return enum per ADR-011
         const val ERR_IO_FAILURE = -1
         const val ERR_SECURITY_VIOLATION = -403
+        const val ERR_BUFFER_TOO_SMALL = -413
         const val ERR_QUOTA_EXCEEDED = -429
+
+        private const val STREAM_CHUNK_SIZE: Long = 8192
     }
 
     /**
@@ -63,13 +78,15 @@ class WasmNetworkEgressHostModule(
                     ValType.I32, // 1: url_len
                     ValType.I32, // 2: method_ptr
                     ValType.I32, // 3: method_len
-                    ValType.I32, // 4: body_ptr
-                    ValType.I32, // 5: body_len
-                    ValType.I32, // 6: out_buf_ptr
-                    ValType.I32, // 7: out_buf_cap
-                    ValType.I32  // 8: out_written_ptr
+                    ValType.I32, // 4: headers_ptr
+                    ValType.I32, // 5: headers_len
+                    ValType.I32, // 6: body_ptr
+                    ValType.I32, // 7: body_len
+                    ValType.I32, // 8: out_buf_ptr
+                    ValType.I32, // 9: out_buf_cap
+                    ValType.I32  // 10: out_written_ptr
                 ),
-                listOf(ValType.I32) // return status code
+                listOf(ValType.I32) // return status code (>= 100 on success, < 0 on failure)
             )
         ) { instance, args ->
             val result = executeHttpFetch(
@@ -78,11 +95,13 @@ class WasmNetworkEgressHostModule(
                 urlLen = args[1].toInt(),
                 methodPtr = args[2].toInt(),
                 methodLen = args[3].toInt(),
-                bodyPtr = args[4].toInt(),
-                bodyLen = args[5].toInt(),
-                outBufPtr = args[6].toInt(),
-                outBufCap = args[7].toInt(),
-                outWrittenPtr = args[8].toInt()
+                headersPtr = args[4].toInt(),
+                headersLen = args[5].toInt(),
+                bodyPtr = args[6].toInt(),
+                bodyLen = args[7].toInt(),
+                outBufPtr = args[8].toInt(),
+                outBufCap = args[9].toInt(),
+                outWrittenPtr = args[10].toInt()
             )
             longArrayOf(result.toLong())
         }
@@ -107,6 +126,8 @@ class WasmNetworkEgressHostModule(
                 urlLen = args[1].toInt(),
                 methodPtr = 0,
                 methodLen = 0,
+                headersPtr = 0,
+                headersLen = 0,
                 bodyPtr = 0,
                 bodyLen = 0,
                 outBufPtr = args[2].toInt(),
@@ -121,6 +142,7 @@ class WasmNetworkEgressHostModule(
 
     /**
      * Executes the HTTP request from WASM memory arguments with full security and quota checks.
+     * Returns HTTP response status code (>= 100) or negative error code without trapping the WASM instance.
      */
     @OptIn(InternalCoroutinesApi::class)
     private fun executeHttpFetch(
@@ -129,65 +151,125 @@ class WasmNetworkEgressHostModule(
         urlLen: Int,
         methodPtr: Int,
         methodLen: Int,
+        headersPtr: Int,
+        headersLen: Int,
         bodyPtr: Int,
         bodyLen: Int,
         outBufPtr: Int,
         outBufCap: Int,
         outWrittenPtr: Int
     ): Int {
-        val memory = instance.memory()
-
-        // 1. Read destination URL from WASM linear memory
-        if (urlLen <= 0) {
-            throw IllegalArgumentException("Invalid URL length: $urlLen")
+        // Enforce non-negative bounds
+        if (urlLen < 0 || methodLen < 0 || headersLen < 0 || bodyLen < 0 || outBufCap < 0 || outWrittenPtr < 0) {
+            return ERR_SECURITY_VIOLATION
         }
-        val urlString = memory.readString(urlPtr, urlLen)
+
+        val memory = instance.memory()
+        val maxQuota = task.maxEgressBytes
+
+        // Fail-closed quota guard per ADR-011: max_egress_bytes must be > 0
+        if (maxQuota <= 0) {
+            return ERR_QUOTA_EXCEEDED
+        }
+
+        // 1. Read and validate destination URL from WASM linear memory
+        if (urlLen == 0) {
+            return ERR_SECURITY_VIOLATION
+        }
+        val urlString = try {
+            memory.readString(urlPtr, urlLen)
+        } catch (e: Exception) {
+            return ERR_SECURITY_VIOLATION
+        }
 
         // 2. Read HTTP method (default to GET)
         val method = if (methodLen > 0) {
-            memory.readString(methodPtr, methodLen).trim().uppercase()
+            try {
+                memory.readString(methodPtr, methodLen).trim().uppercase()
+            } catch (e: Exception) {
+                return ERR_SECURITY_VIOLATION
+            }
         } else {
             "GET"
         }
 
-        // 3. Read request body bytes if present
+        // 3. Read and sanitize HTTP headers
+        val headersMap = if (headersLen > 0) {
+            val headersStr = try {
+                memory.readString(headersPtr, headersLen)
+            } catch (e: Exception) {
+                return ERR_SECURITY_VIOLATION
+            }
+
+            // Bill headers bytes against cumulative quota
+            val hLen = headersLen.toLong()
+            if (cumulativeBytesTransferred.get() + hLen > maxQuota) {
+                return ERR_QUOTA_EXCEEDED
+            }
+            cumulativeBytesTransferred.addAndGet(hLen)
+
+            try {
+                securityGuard.sanitizeHeaders(headersStr)
+            } catch (e: SecurityException) {
+                return ERR_SECURITY_VIOLATION
+            } catch (e: Exception) {
+                return ERR_SECURITY_VIOLATION
+            }
+        } else {
+            emptyMap()
+        }
+
+        // 4. Validate URL, scheme, allowlist, metered state, and pre-flight SSRF addresses
+        val validatedUrl = try {
+            securityGuard.validateOutboundUrl(
+                urlString = urlString,
+                policy = task.egressPolicy,
+                allowedHostnames = task.allowedHostnamesList,
+                maxEgressBytes = maxQuota
+            )
+        } catch (e: SecurityException) {
+            return ERR_SECURITY_VIOLATION
+        } catch (e: IllegalArgumentException) {
+            return ERR_SECURITY_VIOLATION
+        } catch (e: Exception) {
+            return ERR_IO_FAILURE
+        }
+
+        // 5. Read request body bytes if present and bill against quota
         val requestBodyBytes = if (bodyLen > 0) {
-            memory.readBytes(bodyPtr, bodyLen)
+            val reqBytes = bodyLen.toLong()
+            if (cumulativeBytesTransferred.get() + reqBytes > maxQuota) {
+                return ERR_QUOTA_EXCEEDED
+            }
+            cumulativeBytesTransferred.addAndGet(reqBytes)
+
+            try {
+                memory.readBytes(bodyPtr, bodyLen)
+            } catch (e: Exception) {
+                return ERR_SECURITY_VIOLATION
+            }
         } else {
             ByteArray(0)
         }
 
-        // 4. Validate URL, scheme, allowlist, metered state, and SSRF addresses
-        val validatedUrl = securityGuard.validateOutboundUrl(
-            urlString = urlString,
-            policy = task.egressPolicy,
-            allowedHostnames = task.allowedHostnamesList
-        )
-
-        // 5. Enforce max_egress_bytes transfer quota for request body
-        val maxQuota = task.maxEgressBytes
-        val reqBytes = requestBodyBytes.size.toLong()
-        if (maxQuota > 0 && cumulativeBytesTransferred.get() + reqBytes > maxQuota) {
-            throw SecurityException(
-                "Egress quota exceeded: request body ($reqBytes bytes) exceeds remaining max_egress_bytes quota ($maxQuota)"
-            )
-        }
-        cumulativeBytesTransferred.addAndGet(reqBytes)
-
-        // 6. Build OkHttp request
+        // 6. Build OkHttp request with sanitized headers
         val okRequestBody = if (method in listOf("POST", "PUT", "PATCH")) {
             requestBodyBytes.toRequestBody(null)
         } else {
             null
         }
 
-        val request = Request.Builder()
+        val requestBuilder = Request.Builder()
             .url(validatedUrl)
             .method(method, okRequestBody)
-            .build()
 
+        for ((key, value) in headersMap) {
+            requestBuilder.addHeader(key, value)
+        }
+
+        val request = requestBuilder.build()
         val callRef = AtomicReference<Call?>(null)
-        val call = okHttpClient.newCall(request)
+        val call = taskClient.newCall(request)
         callRef.set(call)
 
         // 7. Attach structured cancellation hook to enclosing coroutine Job
@@ -200,41 +282,71 @@ class WasmNetworkEgressHostModule(
         return try {
             call.execute().use { response ->
                 val statusCode = response.code
-                val responseBytes = response.body?.bytes() ?: ByteArray(0)
+                val responseBody = response.body
+                    ?: run {
+                        if (outWrittenPtr != 0) {
+                            memory.writeI32(outWrittenPtr, 0)
+                        }
+                        return statusCode
+                    }
 
-                // Enforce [NFR-PERF-001] 16 MB frame limit
-                if (responseBytes.size > WasmComputeEngine.MAX_FRAME_SIZE_BYTES) {
-                    throw IllegalStateException(
-                        "Response payload size (${responseBytes.size} bytes) exceeds maximum 16 MB frame limit [NFR-PERF-001]"
-                    )
+                val source = responseBody.source()
+                val chunkBuffer = Buffer()
+                var totalBytesRead = 0
+
+                // 8. Stream response body in bounded chunks directly into WASM linear memory
+                while (true) {
+                    val readCount = source.read(chunkBuffer, STREAM_CHUNK_SIZE)
+                    if (readCount == -1L) {
+                        break
+                    }
+
+                    val chunkBytes = chunkBuffer.readByteArray()
+
+                    // Assert out_buf_cap bounds without silent truncation
+                    if (totalBytesRead + chunkBytes.size > outBufCap) {
+                        call.cancel()
+                        return ERR_BUFFER_TOO_SMALL
+                    }
+
+                    // Assert cumulative quota limits
+                    if (cumulativeBytesTransferred.get() + chunkBytes.size > maxQuota) {
+                        call.cancel()
+                        return ERR_QUOTA_EXCEEDED
+                    }
+
+                    // Assert 16 MB frame limit [NFR-PERF-001]
+                    if (totalBytesRead + chunkBytes.size > WasmComputeEngine.MAX_FRAME_SIZE_BYTES) {
+                        call.cancel()
+                        return ERR_SECURITY_VIOLATION
+                    }
+
+                    // Write chunk into linear memory
+                    if (outBufPtr != 0) {
+                        memory.write(outBufPtr + totalBytesRead, chunkBytes, 0, chunkBytes.size)
+                    }
+
+                    totalBytesRead += chunkBytes.size
+                    cumulativeBytesTransferred.addAndGet(chunkBytes.size.toLong())
                 }
 
-                // Check quota for incoming response bytes
-                val respBytesLen = responseBytes.size.toLong()
-                if (maxQuota > 0 && cumulativeBytesTransferred.get() + respBytesLen > maxQuota) {
-                    throw SecurityException(
-                        "Egress quota exceeded: response payload ($respBytesLen bytes) exceeds max_egress_bytes quota ($maxQuota)"
-                    )
-                }
-                cumulativeBytesTransferred.addAndGet(respBytesLen)
-
-                // Write response bytes into WASM output buffer up to out_buf_cap
-                val bytesToWrite = responseBytes.size.coerceAtMost(outBufCap)
-                if (bytesToWrite > 0 && outBufPtr != 0) {
-                    memory.write(outBufPtr, responseBytes, 0, bytesToWrite)
-                }
-
-                // Write actual written bytes count to out_written_ptr if non-zero
+                // Write exact byte count to out_written_ptr if non-zero
                 if (outWrittenPtr != 0) {
-                    memory.writeI32(outWrittenPtr, bytesToWrite)
+                    memory.writeI32(outWrittenPtr, totalBytesRead)
                 }
 
                 statusCode
             }
+        } catch (e: SecurityException) {
+            ERR_SECURITY_VIOLATION
         } catch (e: IOException) {
             if (call.isCanceled() || executionJob?.isActive == false) {
                 throw CancellationException("WASM outbound network request cancelled", e)
             }
+            ERR_IO_FAILURE
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
             ERR_IO_FAILURE
         } finally {
             completionHandle?.dispose()

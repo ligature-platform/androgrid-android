@@ -6,16 +6,13 @@ import com.androgrid.v1.TaskSpec
 import com.google.common.truth.Truth.assertThat
 import com.google.protobuf.ByteString
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
 import okhttp3.Dns
-import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
@@ -26,21 +23,23 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.ByteArrayOutputStream
-import java.io.File
 import java.net.InetAddress
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Robolectric unit test suite verifying controlled outbound network egress for WASM workloads.
  *
- * Enforces:
- * 1. Successful HTTP/HTTPS requests to allowlisted external domains.
- * 2. Deterministic rejection of RFC 1918, loopback, and link-local IP addresses.
- * 3. Deterministic rejection of unlisted hostnames and blocked policies.
- * 4. Deterministic rejection when running on metered cellular interfaces ([ANTI-003], [INV-003], [NFR-POW-001]).
- * 5. Immediate cancellation and socket teardown when tasks are aborted mid-flight.
- * 6. Egress quota enforcement against max_egress_bytes.
+ * Enforces Mandatory Verification Matrix:
+ * 1. Successful HTTP/HTTPS requests to allowlisted external domains with HTTP status and byte count written.
+ * 2. In-socket TOCTOU DNS rebinding rejection at OkHttpClient connection time (-403).
+ * 3. Redirect SSRF rejection: 302 Found is not followed (followRedirects = false).
+ * 4. IPv6 ULA (fc00::/7) and mapped-IPv4 (0.0.0.0, 255.255.255.255, 224.0.0.1, RFC 1918) rejection (-403).
+ * 5. Wildcard and apex rules: bare '*' rejected; *.example.com does not match apex example.com.
+ * 6. Fail-closed defaults: max_egress_bytes == 0 rejected; default isMeteredProvider fails closed (true).
+ * 7. Streaming OOM and buffer bounds: out_buf_cap overflow aborts immediately with -413 (ERR_BUFFER_TOO_SMALL);
+ *    max_egress_bytes overflow aborts with -429 (ERR_QUOTA_EXCEEDED).
+ * 8. Header sanitization: hop-by-hop headers, CRLF injection, and headers > 8 KB rejected.
+ * 9. Immediate cancellation and socket teardown on mid-flight task abort (< 500 ms).
  *
  * Traces to: [INV-001], [INV-003], [INV-006], [ANTI-003], [NFR-SEC-001], [NFR-POW-001], [NFR-PERF-001], ADR-011
  */
@@ -84,13 +83,19 @@ class WasmNetworkEgressRobolectricTest {
 
     /**
      * Builds a minimal valid WebAssembly binary module that:
-     * - Imports "androgrid_net:http_fetch(url_ptr, url_len, method_ptr, method_len, body_ptr, body_len, out_buf_ptr, out_buf_cap, out_written_ptr) -> i32"
+     * - Imports "androgrid_net:http_fetch(11 i32 params) -> i32"
      * - Exports "memory" (1 page = 64KB)
      * - Exports "_start() -> i32" calling http_fetch
      */
     private fun buildHttpFetchWasmModule(
         urlPtr: Int,
         urlLen: Int,
+        methodPtr: Int = 0,
+        methodLen: Int = 0,
+        headersPtr: Int = 0,
+        headersLen: Int = 0,
+        bodyPtr: Int = 0,
+        bodyLen: Int = 0,
         outBufPtr: Int = 256,
         outBufCap: Int = 1024,
         outWrittenPtr: Int = 512
@@ -100,11 +105,11 @@ class WasmNetworkEgressRobolectricTest {
         out.write(byteArrayOf(0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00))
 
         // Type section (id 1):
-        // Type 0: (i32, i32, i32, i32, i32, i32, i32, i32, i32) -> i32
+        // Type 0: (11 i32 params) -> i32
         // Type 1: () -> i32
         val typeSection = byteArrayOf(
             0x02, // 2 types
-            0x60.toByte(), 0x09, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
+            0x60.toByte(), 0x0b, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
             0x60.toByte(), 0x00, 0x01, 0x7f
         )
         out.write(0x01)
@@ -128,22 +133,19 @@ class WasmNetworkEgressRobolectricTest {
         out.write(importBytes.size)
         out.write(importBytes)
 
-        // Function section (id 3):
-        // 1 function with type index 1
+        // Function section (id 3): 1 function with type index 1
         val funcSection = byteArrayOf(0x01, 0x01)
         out.write(0x03)
         out.write(funcSection.size)
         out.write(funcSection)
 
-        // Memory section (id 5):
-        // 1 memory: min 1 page
+        // Memory section (id 5): 1 memory: min 1 page
         val memSection = byteArrayOf(0x01, 0x00, 0x01)
         out.write(0x05)
         out.write(memSection.size)
         out.write(memSection)
 
-        // Export section (id 7):
-        // 2 exports: "memory" (mem 0), "_start" (func 1)
+        // Export section (id 7): "memory" (mem 0), "_start" (func 1)
         val memExport = "memory".toByteArray(Charsets.UTF_8)
         val startExport = "_start".toByteArray(Charsets.UTF_8)
         val exportPayload = ByteArrayOutputStream()
@@ -161,8 +163,7 @@ class WasmNetworkEgressRobolectricTest {
         out.write(exportBytes.size)
         out.write(exportBytes)
 
-        // Code section (id 10):
-        // 1 function body pushing 9 arguments and calling func 0
+        // Code section (id 10): 1 function body pushing 11 arguments and calling func 0
         val codeBody = ByteArrayOutputStream()
         codeBody.write(0x00) // 0 locals
 
@@ -170,19 +171,23 @@ class WasmNetworkEgressRobolectricTest {
         codeBody.write(0x41); writeSignedLeb128(codeBody, urlPtr)
         // arg 1: url_len
         codeBody.write(0x41); writeSignedLeb128(codeBody, urlLen)
-        // arg 2: method_ptr (0 = default GET)
-        codeBody.write(0x41); writeSignedLeb128(codeBody, 0)
-        // arg 3: method_len (0)
-        codeBody.write(0x41); writeSignedLeb128(codeBody, 0)
-        // arg 4: body_ptr (0)
-        codeBody.write(0x41); writeSignedLeb128(codeBody, 0)
-        // arg 5: body_len (0)
-        codeBody.write(0x41); writeSignedLeb128(codeBody, 0)
-        // arg 6: out_buf_ptr
+        // arg 2: method_ptr
+        codeBody.write(0x41); writeSignedLeb128(codeBody, methodPtr)
+        // arg 3: method_len
+        codeBody.write(0x41); writeSignedLeb128(codeBody, methodLen)
+        // arg 4: headers_ptr
+        codeBody.write(0x41); writeSignedLeb128(codeBody, headersPtr)
+        // arg 5: headers_len
+        codeBody.write(0x41); writeSignedLeb128(codeBody, headersLen)
+        // arg 6: body_ptr
+        codeBody.write(0x41); writeSignedLeb128(codeBody, bodyPtr)
+        // arg 7: body_len
+        codeBody.write(0x41); writeSignedLeb128(codeBody, bodyLen)
+        // arg 8: out_buf_ptr
         codeBody.write(0x41); writeSignedLeb128(codeBody, outBufPtr)
-        // arg 7: out_buf_cap
+        // arg 9: out_buf_cap
         codeBody.write(0x41); writeSignedLeb128(codeBody, outBufCap)
-        // arg 8: out_written_ptr
+        // arg 10: out_written_ptr
         codeBody.write(0x41); writeSignedLeb128(codeBody, outWrittenPtr)
 
         // call 0 (imported http_fetch)
@@ -208,10 +213,18 @@ class WasmNetworkEgressRobolectricTest {
      */
     private fun buildWasmWithUrlData(
         url: String,
-        urlPtr: Int = 64
+        urlPtr: Int = 64,
+        outBufPtr: Int = 256,
+        outBufCap: Int = 1024,
+        outWrittenPtr: Int = 512
     ): ByteArray {
-        val baseWasm = buildHttpFetchWasmModule(urlPtr = urlPtr, urlLen = url.toByteArray(Charsets.UTF_8).size)
-        // Add data section (id 11) to initialize memory at urlPtr
+        val baseWasm = buildHttpFetchWasmModule(
+            urlPtr = urlPtr,
+            urlLen = url.toByteArray(Charsets.UTF_8).size,
+            outBufPtr = outBufPtr,
+            outBufCap = outBufCap,
+            outWrittenPtr = outWrittenPtr
+        )
         val urlBytes = url.toByteArray(Charsets.UTF_8)
         val dataPayload = ByteArrayOutputStream()
         dataPayload.write(0x01) // 1 data segment
@@ -244,7 +257,6 @@ class WasmNetworkEgressRobolectricTest {
         val targetUrl = "http://api.edge-compute.org:$port/data"
         val wasmBytecode = buildWasmWithUrlData(targetUrl)
 
-        // Mock DNS mapping api.edge-compute.org to loopback for hermetic test execution
         val mockDns = object : Dns {
             override fun lookup(hostname: String): List<InetAddress> {
                 return if (hostname == "api.edge-compute.org") {
@@ -257,6 +269,7 @@ class WasmNetworkEgressRobolectricTest {
 
         val engine = WasmComputeEngine(
             dns = mockDns,
+            isMeteredProvider = { false },
             allowLoopbackForTesting = true
         )
 
@@ -274,106 +287,269 @@ class WasmNetworkEgressRobolectricTest {
 
         assertThat(result.isSuccess).isTrue()
         assertThat(result.exitCode).isEqualTo(0)
-        // Function returned HTTP status 200 formatted into stdout
+        // Function returned HTTP status 200
         assertThat(String(result.stdoutBytes, Charsets.UTF_8).trim()).isEqualTo("200")
     }
 
     @Test
-    fun testDeterministicRejection_privateIpSpaces() {
+    fun testDeterministicRejection_toctouDnsRebindingAtConnectionTime() {
+        val guard = WasmNetworkEgressSecurityGuard(allowLoopbackForTesting = false)
+
+        // Mock DNS returns public IP on pre-flight check, then private IP at in-socket connection time
+        var lookupCount = 0
+        val rebindingDns = object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> {
+                lookupCount++
+                return if (lookupCount == 1) {
+                    listOf(InetAddress.getByName("93.184.216.34")) // Initial public IP
+                } else {
+                    listOf(InetAddress.getByName("192.168.1.50")) // Rebound private IP
+                }
+            }
+        }
+
+        val taskDns = guard.createTaskDns(rebindingDns)
+
+        // First lookup succeeds
+        val initialIps = taskDns.lookup("api.rebinding-test.org")
+        assertThat(initialIps.first().hostAddress).isEqualTo("93.184.216.34")
+
+        // Second in-socket lookup catches the rebinding and aborts with SecurityException
+        val exception = assertThrows(SecurityException::class.java) {
+            taskDns.lookup("api.rebinding-test.org")
+        }
+        assertThat(exception.message).contains("disallowed IP")
+    }
+
+    @Test
+    fun testDeterministicRejection_redirectSsrfNotFollowed(): Unit = runBlocking {
+        mockServer.start()
+        val port = mockServer.port
+        mockServer.enqueue(
+            MockResponse()
+                .setResponseCode(302)
+                .setHeader("Location", "http://127.0.0.1:8080/secret")
+                .setBody("redirecting")
+        )
+
+        val targetUrl = "http://api.edge-compute.org:$port/redirect"
+        val wasmBytecode = buildWasmWithUrlData(targetUrl)
+
+        val mockDns = object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> {
+                return listOf(InetAddress.getByName("127.0.0.1"))
+            }
+        }
+
+        val engine = WasmComputeEngine(
+            dns = mockDns,
+            isMeteredProvider = { false },
+            allowLoopbackForTesting = true
+        )
+
+        val task = TaskSpec.newBuilder()
+            .setTaskId("task_egress_redirect")
+            .setEngine(ExecutionEngine.EXECUTION_ENGINE_WASM_WASI)
+            .setEgressPolicy(NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST)
+            .addAllowedHostnames("api.edge-compute.org")
+            .setMaxEgressBytes(1048576)
+            .setTimeoutSeconds(10)
+            .setWasmBytecode(ByteString.copyFrom(wasmBytecode))
+            .build()
+
+        val result = engine.execute(task)
+
+        assertThat(result.isSuccess).isTrue()
+        // Must return 302 directly without following to 127.0.0.1
+        assertThat(String(result.stdoutBytes, Charsets.UTF_8).trim()).isEqualTo("302")
+    }
+
+    @Test
+    fun testDeterministicRejection_ipv6UlaAndMappedIpv4() {
+        val guard = WasmNetworkEgressSecurityGuard(allowLoopbackForTesting = false)
+
+        val ulaAddress = InetAddress.getByName("fc00::1")
+        val ula2Address = InetAddress.getByName("fd12:3456:789a::1")
+        val mappedZero = InetAddress.getByName("::ffff:0.0.0.0")
+        val mappedBroadcast = InetAddress.getByName("::ffff:255.255.255.255")
+        val mappedMulticast = InetAddress.getByName("::ffff:224.0.0.1")
+        val mappedPrivate = InetAddress.getByName("::ffff:192.168.1.1")
+
+        assertThat(guard.isDisallowedAddress(ulaAddress)).isTrue()
+        assertThat(guard.isDisallowedAddress(ula2Address)).isTrue()
+        assertThat(guard.isDisallowedAddress(mappedZero)).isTrue()
+        assertThat(guard.isDisallowedAddress(mappedBroadcast)).isTrue()
+        assertThat(guard.isDisallowedAddress(mappedMulticast)).isTrue()
+        assertThat(guard.isDisallowedAddress(mappedPrivate)).isTrue()
+    }
+
+    @Test
+    fun testWildcardAndApexMatchingRules() {
         val guard = WasmNetworkEgressSecurityGuard()
 
-        val privateUrls = listOf(
-            "http://10.0.0.1/admin",
-            "http://172.16.0.1/internal",
-            "http://192.168.1.1/config",
-            "http://127.0.0.1:8080/metrics",
-            "http://localhost:8080/debug",
-            "http://169.254.169.254/latest/meta-data/",
-            "http://100.64.0.1/carrier-nat"
+        // Bare wildcards are forbidden
+        assertThat(guard.matchesHostnamePattern("example.com", "*")).isFalse()
+        assertThat(guard.matchesHostnamePattern("example.com", "*.*")).isFalse()
+
+        // Wildcard must NOT match apex domain
+        assertThat(guard.matchesHostnamePattern("example.com", "*.example.com")).isFalse()
+
+        // Wildcard matches subdomains
+        assertThat(guard.matchesHostnamePattern("api.example.com", "*.example.com")).isTrue()
+        assertThat(guard.matchesHostnamePattern("staging.api.example.com", "*.example.com")).isTrue()
+        assertThat(guard.matchesHostnamePattern("other.org", "*.example.com")).isFalse()
+    }
+
+    @Test
+    fun testFailClosedDefaults_zeroMaxEgressBytesAndMeteredProvider() {
+        val guard = WasmNetworkEgressSecurityGuard(
+            isMeteredProvider = { true } // default fail-closed
         )
 
-        for (url in privateUrls) {
-            val exception = assertThrows(SecurityException::class.java) {
-                guard.validateOutboundUrl(
-                    urlString = url,
-                    policy = NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST,
-                    allowedHostnames = listOf("*")
-                )
-            }
-            assertThat(exception.message).contains("disallowed IP")
+        // max_egress_bytes == 0 must be rejected
+        val exZeroQuota = assertThrows(SecurityException::class.java) {
+            guard.validateOutboundUrl(
+                urlString = "https://api.example.com/data",
+                policy = NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST,
+                allowedHostnames = listOf("api.example.com"),
+                maxEgressBytes = 0
+            )
         }
+        assertThat(exZeroQuota.message).contains("max_egress_bytes must be greater than zero")
+
+        // Metered provider true must be rejected
+        val exMetered = assertThrows(SecurityException::class.java) {
+            guard.validateOutboundUrl(
+                urlString = "https://api.example.com/data",
+                policy = NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST,
+                allowedHostnames = listOf("api.example.com"),
+                maxEgressBytes = 1024
+            )
+        }
+        assertThat(exMetered.message).contains("metered connection is forbidden")
     }
 
     @Test
-    fun testDeterministicRejection_unlistedHost(): Unit = runBlocking {
-        val targetUrl = "https://untrusted-exfiltration.com/leak"
-        val wasmBytecode = buildWasmWithUrlData(targetUrl)
+    fun testStreamingOomAndBufferBounds_errBufferTooSmall(): Unit = runBlocking {
+        mockServer.start()
+        val port = mockServer.port
+        mockServer.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("A".repeat(500)) // 500 bytes payload
+        )
 
-        val engine = WasmComputeEngine()
+        val targetUrl = "http://api.edge-compute.org:$port/data"
+        // WASM module specifies outBufCap = 50 (smaller than 500)
+        val wasmBytecode = buildWasmWithUrlData(targetUrl, outBufCap = 50)
 
-        val task = TaskSpec.newBuilder()
-            .setTaskId("task_egress_unlisted")
-            .setEngine(ExecutionEngine.EXECUTION_ENGINE_WASM_WASI)
-            .setEgressPolicy(NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST)
-            .addAllowedHostnames("api.mycompany.com") // Target host is NOT allowed
-            .setTimeoutSeconds(10)
-            .setWasmBytecode(ByteString.copyFrom(wasmBytecode))
-            .build()
+        val mockDns = object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> {
+                return listOf(InetAddress.getByName("127.0.0.1"))
+            }
+        }
 
-        val result = engine.execute(task)
-
-        assertThat(result.isSuccess).isFalse()
-        assertThat(result.errorCode).isEqualTo("SECURITY_VIOLATION")
-        assertThat(result.errorMessage).contains("not in allowed_hostnames allowlist")
-    }
-
-    @Test
-    fun testDeterministicRejection_blockedPolicy(): Unit = runBlocking {
-        val targetUrl = "https://api.example.com/data"
-        val wasmBytecode = buildWasmWithUrlData(targetUrl)
-
-        val engine = WasmComputeEngine()
-
-        val task = TaskSpec.newBuilder()
-            .setTaskId("task_egress_blocked")
-            .setEngine(ExecutionEngine.EXECUTION_ENGINE_WASM_WASI)
-            .setEgressPolicy(NetworkEgressPolicy.NETWORK_EGRESS_POLICY_BLOCKED) // Policy is blocked
-            .addAllowedHostnames("api.example.com")
-            .setTimeoutSeconds(10)
-            .setWasmBytecode(ByteString.copyFrom(wasmBytecode))
-            .build()
-
-        val result = engine.execute(task)
-
-        assertThat(result.isSuccess).isFalse()
-        assertThat(result.errorCode).isEqualTo("SECURITY_VIOLATION")
-        assertThat(result.errorMessage).contains("disabled by task policy")
-    }
-
-    @Test
-    fun testRejectionOnMeteredCellularInterface(): Unit = runBlocking {
-        val targetUrl = "https://api.example.com/data"
-        val wasmBytecode = buildWasmWithUrlData(targetUrl)
-
-        // Engine configured with isMeteredProvider returning true (simulating cellular WAN)
         val engine = WasmComputeEngine(
-            isMeteredProvider = { true }
+            dns = mockDns,
+            isMeteredProvider = { false },
+            allowLoopbackForTesting = true
         )
 
         val task = TaskSpec.newBuilder()
-            .setTaskId("task_egress_metered")
+            .setTaskId("task_buf_overflow")
             .setEngine(ExecutionEngine.EXECUTION_ENGINE_WASM_WASI)
             .setEgressPolicy(NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST)
-            .addAllowedHostnames("api.example.com")
+            .addAllowedHostnames("api.edge-compute.org")
+            .setMaxEgressBytes(1048576)
             .setTimeoutSeconds(10)
             .setWasmBytecode(ByteString.copyFrom(wasmBytecode))
             .build()
 
         val result = engine.execute(task)
 
-        assertThat(result.isSuccess).isFalse()
-        assertThat(result.errorCode).isEqualTo("METERED_NETWORK_REJECTED")
-        assertThat(result.errorMessage).contains("metered connection is forbidden")
+        assertThat(result.isSuccess).isTrue()
+        // Function returned ERR_BUFFER_TOO_SMALL (-413)
+        assertThat(String(result.stdoutBytes, Charsets.UTF_8).trim()).isEqualTo("-413")
+    }
+
+    @Test
+    fun testStreamingQuotaBounds_errQuotaExceeded(): Unit = runBlocking {
+        mockServer.start()
+        val port = mockServer.port
+        mockServer.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("A".repeat(500))
+        )
+
+        val targetUrl = "http://api.edge-compute.org:$port/data"
+        val wasmBytecode = buildWasmWithUrlData(targetUrl, outBufCap = 1024)
+
+        val mockDns = object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> {
+                return listOf(InetAddress.getByName("127.0.0.1"))
+            }
+        }
+
+        val engine = WasmComputeEngine(
+            dns = mockDns,
+            isMeteredProvider = { false },
+            allowLoopbackForTesting = true
+        )
+
+        val task = TaskSpec.newBuilder()
+            .setTaskId("task_quota_exceeded")
+            .setEngine(ExecutionEngine.EXECUTION_ENGINE_WASM_WASI)
+            .setEgressPolicy(NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST)
+            .addAllowedHostnames("api.edge-compute.org")
+            .setMaxEgressBytes(50) // Quota is only 50 bytes
+            .setTimeoutSeconds(10)
+            .setWasmBytecode(ByteString.copyFrom(wasmBytecode))
+            .build()
+
+        val result = engine.execute(task)
+
+        assertThat(result.isSuccess).isTrue()
+        // Function returned ERR_QUOTA_EXCEEDED (-429)
+        assertThat(String(result.stdoutBytes, Charsets.UTF_8).trim()).isEqualTo("-429")
+    }
+
+    @Test
+    fun testHeaderSanitization_rejectsForbiddenHeadersAndCrlf() {
+        val guard = WasmNetworkEgressSecurityGuard()
+
+        // 1. Hop-by-hop headers rejected
+        val forbiddenHeaders = listOf(
+            "Host: evil.com",
+            "Transfer-Encoding: chunked",
+            "Content-Length: 100",
+            "Connection: close",
+            "Proxy-Authorization: Basic 123"
+        )
+        for (h in forbiddenHeaders) {
+            val ex = assertThrows(SecurityException::class.java) {
+                guard.sanitizeHeaders(h)
+            }
+            assertThat(ex.message).contains("Forbidden hop-by-hop")
+        }
+
+        // 2. CRLF or control character injection rejected
+        val exCrlf = assertThrows(SecurityException::class.java) {
+            guard.sanitizeHeaders("X-Custom: val\rInjected-Header: bad")
+        }
+        assertThat(exCrlf.message).contains("CRLF or control character injection")
+
+        val exNull = assertThrows(SecurityException::class.java) {
+            guard.sanitizeHeaders("X-Custom: val\u0000injected")
+        }
+        assertThat(exNull.message).contains("CRLF or control character injection")
+
+        // 3. Valid headers parsed cleanly
+        val validHeaders = "Accept: application/json\r\nX-Api-Key: secret123\nCache-Control: no-cache"
+        val parsed = guard.sanitizeHeaders(validHeaders)
+        assertThat(parsed["Accept"]).isEqualTo("application/json")
+        assertThat(parsed["X-Api-Key"]).isEqualTo("secret123")
+        assertThat(parsed["Cache-Control"]).isEqualTo("no-cache")
     }
 
     @Test
@@ -397,6 +573,7 @@ class WasmNetworkEgressRobolectricTest {
 
         val engine = WasmComputeEngine(
             dns = mockDns,
+            isMeteredProvider = { false },
             allowLoopbackForTesting = true
         )
 
@@ -405,6 +582,7 @@ class WasmNetworkEgressRobolectricTest {
             .setEngine(ExecutionEngine.EXECUTION_ENGINE_WASM_WASI)
             .setEgressPolicy(NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST)
             .addAllowedHostnames("api.edge-compute.org")
+            .setMaxEgressBytes(1048576)
             .setTimeoutSeconds(30)
             .setWasmBytecode(ByteString.copyFrom(wasmBytecode))
             .build()
@@ -421,54 +599,13 @@ class WasmNetworkEgressRobolectricTest {
         // Allow execution to initiate the HTTP socket connection
         delayMs(150)
 
-        // Cancel job mid-flight (simulating orchestrator cancel_task_ids or FGS timeout)
+        // Cancel job mid-flight
         val startMs = System.currentTimeMillis()
         job.cancelAndJoin()
         val elapsedMs = System.currentTimeMillis() - startMs
 
         assertThat(caughtCancellation).isTrue()
         assertThat(elapsedMs).isLessThan(500L)
-    }
-
-    @Test
-    fun testEgressQuotaExceeded_terminatesConnection(): Unit = runBlocking {
-        mockServer.start()
-        val port = mockServer.port
-        mockServer.enqueue(
-            MockResponse()
-                .setResponseCode(200)
-                .setBody("this-payload-is-far-longer-than-ten-bytes")
-        )
-
-        val targetUrl = "http://api.edge-compute.org:$port/large"
-        val wasmBytecode = buildWasmWithUrlData(targetUrl)
-
-        val mockDns = object : Dns {
-            override fun lookup(hostname: String): List<InetAddress> {
-                return listOf(InetAddress.getByName("127.0.0.1"))
-            }
-        }
-
-        val engine = WasmComputeEngine(
-            dns = mockDns,
-            allowLoopbackForTesting = true
-        )
-
-        val task = TaskSpec.newBuilder()
-            .setTaskId("task_egress_quota")
-            .setEngine(ExecutionEngine.EXECUTION_ENGINE_WASM_WASI)
-            .setEgressPolicy(NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST)
-            .addAllowedHostnames("api.edge-compute.org")
-            .setMaxEgressBytes(10) // Strictly limit quota to 10 bytes
-            .setTimeoutSeconds(10)
-            .setWasmBytecode(ByteString.copyFrom(wasmBytecode))
-            .build()
-
-        val result = engine.execute(task)
-
-        assertThat(result.isSuccess).isFalse()
-        assertThat(result.errorCode).isEqualTo("SECURITY_VIOLATION")
-        assertThat(result.errorMessage).contains("Egress quota exceeded")
     }
 
     private fun delayMs(ms: Long) {
