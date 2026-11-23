@@ -122,6 +122,12 @@ class WasmNetworkEgressHostModule(
         return arrayOf(httpFetch)
     }
 
+    private fun isValidMemoryRange(ptr: Int, len: Int, memorySizeBytes: Long): Boolean {
+        if (ptr < 0 || len < 0) return false
+        val end = ptr.toLong() + len.toLong()
+        return end <= memorySizeBytes
+    }
+
     /**
      * Executes the HTTP request from WASM memory arguments with full security and quota checks.
      * Returns HTTP response status code (>= 100) or negative error code without trapping the WASM instance.
@@ -157,10 +163,14 @@ class WasmNetworkEgressHostModule(
             return ERR_QUOTA_EXCEEDED
         }
 
-        // Linear memory bounds pre-validation
+        // Linear memory bounds pre-validation using Long arithmetic
         val memorySizeBytes = memory.pages().toLong() * 65536L
-        if (outBufPtr.toLong() + outBufCap.toLong() > memorySizeBytes ||
-            outWrittenPtr.toLong() + 4L > memorySizeBytes
+        if (!isValidMemoryRange(urlPtr, urlLen, memorySizeBytes) ||
+            !isValidMemoryRange(methodPtr, methodLen, memorySizeBytes) ||
+            !isValidMemoryRange(headersPtr, headersLen, memorySizeBytes) ||
+            !isValidMemoryRange(bodyPtr, bodyLen, memorySizeBytes) ||
+            !isValidMemoryRange(outBufPtr, outBufCap, memorySizeBytes) ||
+            !isValidMemoryRange(outWrittenPtr, 4, memorySizeBytes)
         ) {
             return ERR_SECURITY_VIOLATION
         }
@@ -225,7 +235,7 @@ class WasmNetworkEgressHostModule(
         }
 
         // 5. Read request body bytes if present for methods that transmit body
-        val sendsBody = method in listOf("POST", "PUT", "PATCH")
+        val sendsBody = method in listOf("POST", "PUT", "PATCH") || (method == "DELETE" && bodyLen > 0)
         val requestBodyBytes = if (bodyLen > 0 && sendsBody) {
             try {
                 memory.readBytes(bodyPtr, bodyLen)
@@ -297,7 +307,9 @@ class WasmNetworkEgressHostModule(
                         if (outWrittenPtr >= 0) {
                             try {
                                 memory.writeI32(outWrittenPtr, 0)
-                            } catch (_: Exception) {}
+                            } catch (e: Exception) {
+                                return ERR_SECURITY_VIOLATION
+                            }
                         }
                         return statusCode
                     }
@@ -323,15 +335,15 @@ class WasmNetworkEgressHostModule(
                     }
 
                     // Assert out_buf_cap bounds without silent truncation
-                    if (totalBytesRead + readCount > outBufCap) {
+                    if (totalBytesRead.toLong() + readCount.toLong() > outBufCap.toLong()) {
                         call.cancel()
                         return ERR_BUFFER_TOO_SMALL
                     }
 
                     // Assert 16 MB frame limit [NFR-PERF-001]
-                    if (totalBytesRead + readCount > WasmComputeEngine.MAX_FRAME_SIZE_BYTES) {
+                    if (totalBytesRead.toLong() + readCount.toLong() > WasmComputeEngine.MAX_FRAME_SIZE_BYTES) {
                         call.cancel()
-                        return ERR_SECURITY_VIOLATION
+                        return ERR_BUFFER_TOO_SMALL
                     }
 
                     // Write chunk into linear memory

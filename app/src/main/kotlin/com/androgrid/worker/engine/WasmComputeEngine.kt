@@ -72,6 +72,7 @@ class WasmComputeEngine(
             client.dispatcher.executorService.shutdownNow()
             client.connectionPool.evictAll()
         }
+        lazyOwnedClient = null
     }
 
     private class WasmCancelledTrap : RuntimeException("WASM execution cancelled")
@@ -113,14 +114,14 @@ class WasmComputeEngine(
         }
 
         // Step 2b: Enforce Metered Network Guard per [ANTI-003], [INV-003], [NFR-POW-001]
-        if (isMeteredProvider.invoke() && task.egressPolicy == com.androgrid.v1.NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST) {
+        if (isMeteredProvider.invoke() && (task.requiresUnmetered || task.egressPolicy == com.androgrid.v1.NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST)) {
             if (propagateSecurityExceptions) {
-                throw SecurityException("Outbound network access over metered connection is forbidden per [INV-003] and [ANTI-003]")
+                throw SecurityException("Execution over metered connection is forbidden per [INV-003] and [ANTI-003]")
             }
             return TaskExecutionResult.failure(
                 exitCode = -1,
                 errorCode = "METERED_NETWORK_REJECTED",
-                errorMessage = "Outbound network access over metered connection is forbidden per [INV-003] and [ANTI-003]"
+                errorMessage = "Execution over metered connection is forbidden per [INV-003] and [ANTI-003]"
             )
         }
 
@@ -359,8 +360,8 @@ class WasmComputeEngine(
                     stderrBytes = stderrBytes
                 )
             } catch (t: Throwable) {
-                if (t is WasmCancelledTrap || t.cause is WasmCancelledTrap || cancelled.get()) {
-                    throw CancellationException("WASM execution cancelled", t)
+                if (t is CancellationException || t.cause is CancellationException || t is WasmCancelledTrap || t.cause is WasmCancelledTrap || cancelled.get()) {
+                    throw (t as? CancellationException) ?: (t.cause as? CancellationException) ?: CancellationException("WASM execution cancelled", t)
                 }
                 val stdoutBytes = stdoutStream.toByteArray()
                 val stderrBytes = stderrStream.toByteArray()

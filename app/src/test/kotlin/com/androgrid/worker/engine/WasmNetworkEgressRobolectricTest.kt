@@ -301,9 +301,13 @@ class WasmNetworkEgressRobolectricTest {
                 java.io.File("../androgrid-backend/workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm"),
                 java.io.File("../../androgrid-backend/workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm"),
                 java.io.File("../androgrid-backend/tests/fixtures/wasm/http_benchmark.wasm"),
-                java.io.File("../../androgrid-backend/tests/fixtures/wasm/http_benchmark.wasm")
+                java.io.File("../../androgrid-backend/tests/fixtures/wasm/http_benchmark.wasm"),
+                java.io.File("src/test/resources/fixtures/http_benchmark.wasm"),
+                java.io.File("app/src/test/resources/fixtures/http_benchmark.wasm")
             )
-            val wasmFile = candidates.firstOrNull { it.exists() } ?: return@runBlocking
+            val wasmFile = checkNotNull(candidates.firstOrNull { it.exists() }) {
+                "Fixture missing: http_benchmark.wasm could not be located in candidates: $candidates"
+            }
             wasmFile.readBytes()
         }
 
@@ -751,6 +755,70 @@ class WasmNetworkEgressRobolectricTest {
         assertThat(guard.matchesHostnamePattern("evil.co.uk", "*.co.uk")).isFalse()
         assertThat(guard.matchesHostnamePattern("evil.workers.dev", "*.workers.dev")).isFalse()
         assertThat(guard.matchesHostnamePattern("evil.amazonaws.com", "*.amazonaws.com")).isFalse()
+        assertThat(guard.matchesHostnamePattern("sub.co.il", "*.co.il")).isFalse()
+        assertThat(guard.matchesHostnamePattern("my-app.run.app", "*.run.app")).isFalse()
+    }
+
+    @Test
+    fun testIpv4MappedLoopbackExplicitRawBytes() {
+        val guard = WasmNetworkEgressSecurityGuard(allowLoopbackForTesting = false)
+
+        // ::ffff:127.0.0.1 constructed via raw 16 bytes
+        val raw16Bytes = ByteArray(16)
+        raw16Bytes[10] = 0xFF.toByte()
+        raw16Bytes[11] = 0xFF.toByte()
+        raw16Bytes[12] = 127.toByte()
+        raw16Bytes[13] = 0.toByte()
+        raw16Bytes[14] = 0.toByte()
+        raw16Bytes[15] = 1.toByte()
+
+        val rawAddr = java.net.Inet6Address.getByAddress(null, raw16Bytes, -1)
+        assertThat(guard.isDisallowedAddress(rawAddr)).isTrue()
+    }
+
+    @Test
+    fun testRfc6890DisallowedRanges() {
+        val guard = WasmNetworkEgressSecurityGuard(allowLoopbackForTesting = false)
+
+        // 192.88.99.1 (6to4 relay)
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("192.88.99.1"))).isTrue()
+
+        // 2001:db8::1 (Documentation)
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("2001:db8::1"))).isTrue()
+
+        // 100::1 (Discard)
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("100::1"))).isTrue()
+
+        // 2001:10::1 and 2001:20::1 (ORCHIDv2)
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("2001:10::1"))).isTrue()
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("2001:20::1"))).isTrue()
+
+        // IPv4-translated ::ffff:0:127.0.0.1
+        val translatedBytes = ByteArray(16)
+        translatedBytes[8] = 0xFF.toByte()
+        translatedBytes[9] = 0xFF.toByte()
+        translatedBytes[12] = 127.toByte()
+        translatedBytes[15] = 1.toByte()
+        val translatedAddr = java.net.Inet6Address.getByAddress(null, translatedBytes, -1)
+        assertThat(guard.isDisallowedAddress(translatedAddr)).isTrue()
+    }
+
+    @Test
+    fun testTaskRequiresUnmeteredFailsOnMeteredNetwork() = runBlocking {
+        val engine = WasmComputeEngine(
+            isMeteredProvider = { true }
+        )
+
+        val task = TaskSpec.newBuilder()
+            .setTaskId("task_metered_check")
+            .setEngine(ExecutionEngine.EXECUTION_ENGINE_WASM_WASI)
+            .setRequiresUnmetered(true)
+            .setWasmBytecode(ByteString.copyFrom(ByteArray(8)))
+            .build()
+
+        val result = engine.execute(task)
+        assertThat(result.exitCode).isEqualTo(-1)
+        assertThat(result.errorCode).isEqualTo("METERED_NETWORK_REJECTED")
     }
 
     private fun delayMs(ms: Long) {
