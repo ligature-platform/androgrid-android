@@ -139,9 +139,9 @@ class DefaultUpgradeManager(
     private val currentVersionProvider: () -> String = {
         try {
             val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
-            packageInfo.versionName ?: "0.0.1-alpha.4"
+            packageInfo.versionName ?: "0.0.1-alpha.5"
         } catch (_: Exception) {
-            "0.0.1-alpha.4"
+            "0.0.1-alpha.5"
         }
     },
     private val downloadClient: (suspend (url: String, destFile: File) -> Boolean)? = null,

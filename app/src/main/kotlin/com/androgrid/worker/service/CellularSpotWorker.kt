@@ -112,7 +112,7 @@ class CellularSpotWorkerLogic(
                 thermalStatus = thermalStatus
             )
 
-            val clientVersion = upgradeManager?.currentVersion ?: "0.0.1-alpha.4"
+            val clientVersion = upgradeManager?.currentVersion ?: "0.0.1-alpha.5"
 
             val claimRequestBuilder = ClaimCellularTaskRequest.newBuilder()
                 .setNodeId(nodeId)

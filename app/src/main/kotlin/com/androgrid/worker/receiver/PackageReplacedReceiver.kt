@@ -32,9 +32,9 @@ class PackageReplacedReceiver : BroadcastReceiver() {
         val upgradeLedger = com.androgrid.worker.upgrade.SharedPreferencesUpgradeLedger(context)
         val currentVersion = try {
             val pkgInfo = context.packageManager.getPackageInfo(context.packageName, 0)
-            pkgInfo.versionName ?: "0.0.1-alpha.4"
+            pkgInfo.versionName ?: "0.0.1-alpha.5"
         } catch (_: Exception) {
-            "0.0.1-alpha.4"
+            "0.0.1-alpha.5"
         }
         upgradeLedger.checkPendingUpgradeOnStartup(currentVersion)
 
