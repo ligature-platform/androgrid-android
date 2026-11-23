@@ -49,7 +49,14 @@ class WasmNetworkEgressHostModule(
         .dns(securityGuard.createTaskDns())
         .followRedirects(false)
         .followSslRedirects(false)
+        .connectTimeout(minOf(10L, effectiveTimeoutSec()), java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(minOf(30L, effectiveTimeoutSec()), java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(minOf(30L, effectiveTimeoutSec()), java.util.concurrent.TimeUnit.SECONDS)
+        .callTimeout(minOf(30L, effectiveTimeoutSec()), java.util.concurrent.TimeUnit.SECONDS)
         .build()
+
+    private fun effectiveTimeoutSec(): Long =
+        if (task.timeoutSeconds > 0) task.timeoutSeconds.toLong() else 30L
 
     companion object {
         const val MODULE_NAME = "androgrid_net"
@@ -59,6 +66,8 @@ class WasmNetworkEgressHostModule(
         const val ERR_SECURITY_VIOLATION = -403
         const val ERR_BUFFER_TOO_SMALL = -413
         const val ERR_QUOTA_EXCEEDED = -429
+
+        val ALLOWED_METHODS: Set<String> = setOf("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
 
         private const val STREAM_CHUNK_SIZE: Long = 8192
     }
@@ -160,7 +169,10 @@ class WasmNetworkEgressHostModule(
         outWrittenPtr: Int
     ): Int {
         // Enforce non-negative bounds
-        if (urlLen < 0 || methodLen < 0 || headersLen < 0 || bodyLen < 0 || outBufCap < 0 || outWrittenPtr < 0) {
+        if (urlPtr < 0 || urlLen < 0 || methodPtr < 0 || methodLen < 0 ||
+            headersPtr < 0 || headersLen < 0 || bodyPtr < 0 || bodyLen < 0 ||
+            outBufPtr < 0 || outBufCap < 0 || outWrittenPtr < 0
+        ) {
             return ERR_SECURITY_VIOLATION
         }
 
@@ -182,6 +194,13 @@ class WasmNetworkEgressHostModule(
             return ERR_SECURITY_VIOLATION
         }
 
+        // Bill request URL bytes against quota
+        val uLen = urlLen.toLong()
+        if (cumulativeBytesTransferred.get() + uLen > maxQuota) {
+            return ERR_QUOTA_EXCEEDED
+        }
+        cumulativeBytesTransferred.addAndGet(uLen)
+
         // 2. Read HTTP method (default to GET)
         val method = if (methodLen > 0) {
             try {
@@ -191,6 +210,9 @@ class WasmNetworkEgressHostModule(
             }
         } else {
             "GET"
+        }
+        if (method !in ALLOWED_METHODS) {
+            return ERR_SECURITY_VIOLATION
         }
 
         // 3. Read and sanitize HTTP headers
@@ -252,27 +274,7 @@ class WasmNetworkEgressHostModule(
             ByteArray(0)
         }
 
-        // 6. Build OkHttp request with sanitized headers
-        val okRequestBody = if (method in listOf("POST", "PUT", "PATCH")) {
-            requestBodyBytes.toRequestBody(null)
-        } else {
-            null
-        }
-
-        val requestBuilder = Request.Builder()
-            .url(validatedUrl)
-            .method(method, okRequestBody)
-
-        for ((key, value) in headersMap) {
-            requestBuilder.addHeader(key, value)
-        }
-
-        val request = requestBuilder.build()
         val callRef = AtomicReference<Call?>(null)
-        val call = taskClient.newCall(request)
-        callRef.set(call)
-
-        // 7. Attach structured cancellation hook to enclosing coroutine Job
         val completionHandle = executionJob?.invokeOnCompletion(onCancelling = true) { cause ->
             if (cause != null) {
                 callRef.get()?.cancel()
@@ -280,12 +282,40 @@ class WasmNetworkEgressHostModule(
         }
 
         return try {
+            // 6. Build OkHttp request with sanitized headers
+            val okRequestBody = if (method in listOf("POST", "PUT", "PATCH")) {
+                requestBodyBytes.toRequestBody(null)
+            } else {
+                null
+            }
+
+            val requestBuilder = Request.Builder()
+                .url(validatedUrl)
+                .method(method, okRequestBody)
+
+            for ((key, value) in headersMap) {
+                requestBuilder.addHeader(key, value)
+            }
+
+            val request = requestBuilder.build()
+            val call = taskClient.newCall(request)
+            callRef.set(call)
+
             call.execute().use { response ->
+                val responseHeadersBytes = response.headers.byteCount()
+                if (cumulativeBytesTransferred.get() + responseHeadersBytes > maxQuota) {
+                    call.cancel()
+                    return ERR_QUOTA_EXCEEDED
+                }
+                cumulativeBytesTransferred.addAndGet(responseHeadersBytes)
+
                 val statusCode = response.code
                 val responseBody = response.body
                     ?: run {
                         if (outWrittenPtr != 0) {
-                            memory.writeI32(outWrittenPtr, 0)
+                            try {
+                                memory.writeI32(outWrittenPtr, 0)
+                            } catch (_: Exception) {}
                         }
                         return statusCode
                     }
@@ -322,8 +352,13 @@ class WasmNetworkEgressHostModule(
                     }
 
                     // Write chunk into linear memory
-                    if (outBufPtr != 0) {
-                        memory.write(outBufPtr + totalBytesRead, chunkBytes, 0, chunkBytes.size)
+                    if (outBufCap > 0) {
+                        try {
+                            memory.write(outBufPtr + totalBytesRead, chunkBytes, 0, chunkBytes.size)
+                        } catch (e: Exception) {
+                            call.cancel()
+                            return ERR_SECURITY_VIOLATION
+                        }
                     }
 
                     totalBytesRead += chunkBytes.size
@@ -332,15 +367,21 @@ class WasmNetworkEgressHostModule(
 
                 // Write exact byte count to out_written_ptr if non-zero
                 if (outWrittenPtr != 0) {
-                    memory.writeI32(outWrittenPtr, totalBytesRead)
+                    try {
+                        memory.writeI32(outWrittenPtr, totalBytesRead)
+                    } catch (e: Exception) {
+                        return ERR_SECURITY_VIOLATION
+                    }
                 }
 
                 statusCode
             }
+        } catch (e: IllegalArgumentException) {
+            ERR_SECURITY_VIOLATION
         } catch (e: SecurityException) {
             ERR_SECURITY_VIOLATION
         } catch (e: IOException) {
-            if (call.isCanceled() || executionJob?.isActive == false) {
+            if (callRef.get()?.isCanceled() == true || executionJob?.isActive == false) {
                 throw CancellationException("WASM outbound network request cancelled", e)
             }
             ERR_IO_FAILURE

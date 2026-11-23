@@ -50,6 +50,13 @@ class WasmNetworkEgressSecurityGuard(
             "proxy-authorization",
             "proxy-authenticate"
         )
+
+        val FORBIDDEN_WILDCARD_SUFFIXES: Set<String> = setOf(
+            "com", "org", "net", "edu", "gov", "mil", "io", "co.uk", "org.uk",
+            "gov.uk", "com.au", "net.au", "co.jp", "com.br", "co.nz", "com.sg",
+            "co.za", "de", "fr", "nl", "ru", "cn", "in", "uk", "au", "ca", "jp", "eu",
+            "ai", "app", "dev", "xyz", "cloud", "workers.dev", "amazonaws.com", "github.io"
+        )
     }
 
     /**
@@ -99,6 +106,9 @@ class WasmNetworkEgressSecurityGuard(
 
             // Multicast (224.0.0.0/4: 224 to 239)
             if (b0 in 224..239) return true
+
+            // Reserved / Future Use (240.0.0.0/4: 240 to 255)
+            if (b0 >= 240) return true
         }
 
         // IPv6-specific checks
@@ -120,6 +130,20 @@ class WasmNetworkEgressSecurityGuard(
 
             // Loopback (::1)
             if (raw.take(15).all { it == 0.toByte() } && raw[15] == 1.toByte()) return true
+
+            // NAT64 Well-Known Prefix (64:ff9b::/96)
+            val isNat64WellKnown = raw[0] == 0x00.toByte() && raw[1] == 0x64.toByte() &&
+                    raw[2] == 0xFF.toByte() && raw[3] == 0x9B.toByte() &&
+                    raw.slice(4..11).all { it == 0.toByte() }
+            if (isNat64WellKnown) {
+                val ipv4Bytes = ByteArray(4) { i -> raw[12 + i] }
+                val mappedAddr = try {
+                    InetAddress.getByAddress(ipv4Bytes)
+                } catch (e: Exception) {
+                    return true
+                }
+                return isDisallowedAddress(mappedAddr)
+            }
 
             // IPv4-mapped IPv6 checks (::ffff:a.b.c.d)
             val isIpv4Mapped = raw.take(10).all { it == 0.toByte() } &&
@@ -151,16 +175,28 @@ class WasmNetworkEgressSecurityGuard(
      * @return True if hostname matches pattern, false otherwise.
      */
     fun matchesHostnamePattern(hostname: String, pattern: String): Boolean {
-        val cleanHost = hostname.trim().lowercase()
-        val cleanPattern = pattern.trim().lowercase()
+        val cleanHost = hostname.trim().lowercase().removeSuffix(".")
+        val cleanPattern = pattern.trim().lowercase().removeSuffix(".")
 
-        // Bare wildcards are strictly forbidden
-        if (cleanPattern == "*" || cleanPattern == "*.*") {
+        // Bare wildcards, mid-string wildcards, or consecutive dots are strictly forbidden
+        if (cleanPattern == "*" || cleanPattern == "*.*" || cleanPattern.contains("..")) {
+            return false
+        }
+        if (cleanPattern.indexOf('*') > 0) {
             return false
         }
 
         if (cleanPattern.startsWith("*.")) {
             val suffix = cleanPattern.removePrefix("*.")
+            val parts = suffix.split('.')
+            // Must have >= 2 dot-separated parts in suffix (meaning >= 3 labels total with wildcard)
+            if (parts.size < 2) {
+                return false
+            }
+            // Must not target public suffix
+            if (FORBIDDEN_WILDCARD_SUFFIXES.contains(suffix)) {
+                return false
+            }
             // Apex domain must NOT match the wildcard pattern
             if (cleanHost == suffix) {
                 return false
@@ -308,6 +344,21 @@ class WasmNetworkEgressSecurityGuard(
             )
         }
 
+        // Enforce HTTPS-only for remote production workers
+        if (scheme == "http" && !allowLoopbackForTesting) {
+            throw SecurityException(
+                "Cleartext HTTP traffic is strictly forbidden on Android worker nodes. HTTPS is required. [NFR-SEC-001]"
+            )
+        }
+
+        // Enforce standard ports (443 for HTTPS, 80 for loopback testing)
+        val expectedPort = if (scheme == "https") 443 else 80
+        if (httpUrl.port != expectedPort && !allowLoopbackForTesting) {
+            throw SecurityException(
+                "Forbidden port '${httpUrl.port}'. Only port 443 for HTTPS is permitted. [INV-001], [NFR-SEC-001]"
+            )
+        }
+
         val host = httpUrl.host
 
         // Step 5: Validate hostname against allowed_hostnames allowlist
@@ -326,21 +377,17 @@ class WasmNetworkEgressSecurityGuard(
             )
         }
 
-        // Step 6: DNS Pre-flight address inspection for SSRF and private space guard
-        val resolvedAddresses = try {
-            dns.lookup(host)
-        } catch (e: Exception) {
-            throw SecurityException("Unable to resolve destination host '$host': ${e.message}", e)
-        }
-
-        if (resolvedAddresses.isEmpty()) {
-            throw SecurityException("Unable to resolve destination host '$host'")
-        }
-
-        for (addr in resolvedAddresses) {
-            if (isDisallowedAddress(addr)) {
+        // Step 6: If host is an IP literal, enforce SSRF guard upfront
+        val isIpLiteral = host.matches(Regex("^(\\d{1,3}\\.){3}\\d{1,3}$")) || host.contains(':')
+        if (isIpLiteral) {
+            val literalAddr = try {
+                InetAddress.getByName(host)
+            } catch (e: Exception) {
+                throw SecurityException("Invalid IP literal host '$host': ${e.message}")
+            }
+            if (isDisallowedAddress(literalAddr)) {
                 throw SecurityException(
-                    "SSRF Guard: Host '$host' resolved to disallowed IP ${addr.hostAddress} (RFC 1918 / Loopback / Link-Local guard). [INV-006], [NFR-SEC-001]"
+                    "SSRF Guard: IP literal '$host' targets a disallowed address. [INV-006], [NFR-SEC-001]"
                 )
             }
         }

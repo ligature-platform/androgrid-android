@@ -608,6 +608,51 @@ class WasmNetworkEgressRobolectricTest {
         assertThat(elapsedMs).isLessThan(500L)
     }
 
+    @Test
+    fun testPortAndSchemeEnforcement() {
+        val guard = WasmNetworkEgressSecurityGuard(
+            isMeteredProvider = { false },
+            allowLoopbackForTesting = false
+        )
+
+        // Non-443 port must be rejected in production mode
+        val exPort = assertThrows(SecurityException::class.java) {
+            guard.validateOutboundUrl(
+                urlString = "https://api.example.com:8443/data",
+                policy = NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST,
+                allowedHostnames = listOf("api.example.com"),
+                maxEgressBytes = 1048576
+            )
+        }
+        assertThat(exPort.message).contains("Forbidden port")
+
+        // Plaintext http:// must be rejected in production mode
+        val exScheme = assertThrows(SecurityException::class.java) {
+            guard.validateOutboundUrl(
+                urlString = "http://api.example.com/data",
+                policy = NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST,
+                allowedHostnames = listOf("api.example.com"),
+                maxEgressBytes = 1048576
+            )
+        }
+        assertThat(exScheme.message).contains("Cleartext HTTP traffic is strictly forbidden")
+    }
+
+    @Test
+    fun testNat64PrefixAndPublicSuffixRejection() {
+        val guard = WasmNetworkEgressSecurityGuard(allowLoopbackForTesting = false)
+
+        // NAT64 well-known prefix mapping to private 10.0.0.1
+        val nat64Private = InetAddress.getByName("64:ff9b::10.0.0.1")
+        assertThat(guard.isDisallowedAddress(nat64Private)).isTrue()
+
+        // Bare TLD / Public suffix wildcard rejection on-device
+        assertThat(guard.matchesHostnamePattern("evil.com", "*.com")).isFalse()
+        assertThat(guard.matchesHostnamePattern("evil.co.uk", "*.co.uk")).isFalse()
+        assertThat(guard.matchesHostnamePattern("evil.workers.dev", "*.workers.dev")).isFalse()
+        assertThat(guard.matchesHostnamePattern("evil.amazonaws.com", "*.amazonaws.com")).isFalse()
+    }
+
     private fun delayMs(ms: Long) {
         try {
             Thread.sleep(ms)

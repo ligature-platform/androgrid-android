@@ -65,7 +65,7 @@ class WasmComputeEngine(
 
     override fun close() {
         ownedOkHttpClient?.let { client ->
-            client.dispatcher.executorService.shutdown()
+            client.dispatcher.executorService.shutdownNow()
             client.connectionPool.evictAll()
         }
     }
@@ -219,16 +219,18 @@ class WasmComputeEngine(
             allowLoopbackForTesting = allowLoopbackForTesting
         )
 
-        val egressModule = WasmNetworkEgressHostModule(
-            task = task,
-            securityGuard = securityGuard,
-            okHttpClient = effectiveBaseClient,
-            executionJob = executionJob
-        )
-
         val hostFunctions = mutableListOf<com.dylibso.chicory.runtime.HostFunction>()
         hostFunctions.addAll(wasi.toHostFunctions())
-        hostFunctions.addAll(egressModule.toHostFunctions())
+
+        if (task.egressPolicy == com.androgrid.v1.NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST) {
+            val egressModule = WasmNetworkEgressHostModule(
+                task = task,
+                securityGuard = securityGuard,
+                okHttpClient = effectiveBaseClient,
+                executionJob = executionJob
+            )
+            hostFunctions.addAll(egressModule.toHostFunctions())
+        }
 
         val store = Store().addFunction(*hostFunctions.toTypedArray())
 
