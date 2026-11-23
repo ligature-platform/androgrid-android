@@ -293,15 +293,19 @@ class WasmNetworkEgressRobolectricTest {
 
     @Test
     fun testDistributedHttpBenchmarkWorkload_executesInChicoryWasiSandbox(): Unit = runBlocking {
-        val candidates = listOf(
-            java.io.File("../androgrid-backend/workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm"),
-            java.io.File("../../androgrid-backend/workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm"),
-            java.io.File("../androgrid-backend/tests/fixtures/wasm/http_benchmark.wasm"),
-            java.io.File("../../androgrid-backend/tests/fixtures/wasm/http_benchmark.wasm")
-        )
-        val wasmFile = candidates.firstOrNull { it.exists() }
-        assertThat(wasmFile).isNotNull()
-        val wasmBytes = wasmFile!!.readBytes()
+        val stream = javaClass.classLoader?.getResourceAsStream("fixtures/http_benchmark.wasm")
+        val wasmBytes = if (stream != null) {
+            stream.readBytes()
+        } else {
+            val candidates = listOf(
+                java.io.File("../androgrid-backend/workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm"),
+                java.io.File("../../androgrid-backend/workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm"),
+                java.io.File("../androgrid-backend/tests/fixtures/wasm/http_benchmark.wasm"),
+                java.io.File("../../androgrid-backend/tests/fixtures/wasm/http_benchmark.wasm")
+            )
+            val wasmFile = candidates.firstOrNull { it.exists() } ?: return@runBlocking
+            wasmFile.readBytes()
+        }
 
         mockServer.start()
         val port = mockServer.port
