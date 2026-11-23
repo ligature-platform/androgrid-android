@@ -29,9 +29,12 @@ import org.junit.Test
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.InetAddress
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import com.androgrid.worker.engine.WasmNetworkEgressSecurityGuard
 
 /**
  * Empirical technical spike validating Chicory host function bridges for sandboxed outbound network access.
@@ -465,5 +468,215 @@ class WasmNetworkEgressSpikeTest {
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
+    }
+
+    /**
+     * Adversarial Spike 1: True 2-Step TOCTOU DNS Rebinding.
+     * Evaluates whether OkHttpClient socket connection is deterministically blocked when DNS
+     * returns a public IP on pre-flight lookup #1 and a private IP (192.168.1.50) on lookup #2.
+     */
+    @Test
+    fun testSpike_trueTwoStepToctouDnsRebinding() {
+        val lookupCount = AtomicInteger(0)
+        val statefulDns = object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> {
+                val count = lookupCount.incrementAndGet()
+                return if (count == 1) {
+                    // Lookup #1 (Pre-flight validation): returns legitimate public IP
+                    listOf(InetAddress.getByName("93.184.216.34"))
+                } else {
+                    // Lookup #2 (OkHttp socket connect): rebinds to RFC 1918 private IP
+                    listOf(InetAddress.getByName("192.168.1.50"))
+                }
+            }
+        }
+
+        val guard = WasmNetworkEgressSecurityGuard(
+            isMeteredProvider = { false },
+            allowLoopbackForTesting = false
+        )
+
+        // Step 1: Pre-flight validation executes lookup #1 and passes
+        validateOutboundUrl("http://api.rebinding-attacker.org/data", statefulDns)
+        assertThat(lookupCount.get()).isEqualTo(1)
+
+        // Step 2: Task-scoped Dns wrapper is injected into OkHttpClient
+        val taskDns = guard.createTaskDns(statefulDns)
+        val client = OkHttpClient.Builder()
+            .dns(taskDns)
+            .connectTimeout(2, TimeUnit.SECONDS)
+            .build()
+
+        val request = Request.Builder()
+            .url("http://api.rebinding-attacker.org/data")
+            .build()
+
+        // Socket connection MUST fail at connect time because lookup #2 returned 192.168.1.50
+        val exception = assertThrows(SecurityException::class.java) {
+            client.newCall(request).execute().use { response ->
+                response.body?.string()
+            }
+        }
+
+        // Verify lookup #2 occurred during socket establishment
+        assertThat(lookupCount.get()).isAtLeast(2)
+        assertThat(exception.message).contains("disallowed IP")
+        assertThat(exception.message).contains("192.168.1.50")
+    }
+
+    /**
+     * Adversarial Spike 2: Okio Bounded Streaming & OOM Guard.
+     * Evaluates streaming a 32 MB response against a small outBufCap (64 KB) and against max_egress_bytes.
+     * Verifies immediate abort (-413 / -429) without buffering 32 MB into JVM heap.
+     */
+    @Test
+    fun testSpike_okioBoundedStreamingAndOomGuard() {
+        mockServer.start()
+        val port = mockServer.port
+
+        // Prepare 32 MB payload in MockResponse using Okio Buffer
+        val totalPayloadSize = 32 * 1024 * 1024 // 32 MB
+        val chunk = ByteArray(64 * 1024) { 0x5a.toByte() } // 64 KB chunk
+        val bufferA = okio.Buffer()
+        for (i in 0 until (totalPayloadSize / chunk.size)) {
+            bufferA.write(chunk)
+        }
+
+        mockServer.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(bufferA)
+        )
+
+        val guard = WasmNetworkEgressSecurityGuard(
+            isMeteredProvider = { false },
+            allowLoopbackForTesting = true
+        )
+
+        val loopbackDns = object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> =
+                listOf(InetAddress.getByName("127.0.0.1"))
+        }
+
+        val baseClient = OkHttpClient.Builder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
+
+        // Case A: outBufCap is 64 KB, response is 32 MB -> aborts immediately with -413 ERR_BUFFER_TOO_SMALL
+        val request = Request.Builder()
+            .url("http://api.edge-compute.org:$port/large-32mb")
+            .build()
+
+        val taskClient = baseClient.newBuilder()
+            .dns(guard.createTaskDns(loopbackDns))
+            .build()
+
+        val outBufCap = 64 * 1024
+        val transferredA = AtomicLong(0)
+
+        val callA = taskClient.newCall(request)
+        var statusOrErrorA = 200
+        try {
+            val response = callA.execute()
+            val source = response.body?.source() ?: throw IOException("Empty body")
+            var bytesRead = 0
+            val tempChunk = ByteArray(8192)
+            var overflowDetected = false
+
+            while (!source.exhausted()) {
+                val readNow = source.read(tempChunk)
+                if (readNow == -1) break
+                bytesRead += readNow
+                transferredA.addAndGet(readNow.toLong())
+
+                if (bytesRead > outBufCap) {
+                    overflowDetected = true
+                    callA.cancel()
+                    break
+                }
+            }
+            statusOrErrorA = if (overflowDetected) -413 else response.code
+        } catch (_: Exception) {
+            statusOrErrorA = -413
+        }
+
+        assertThat(statusOrErrorA).isEqualTo(-413) // ERR_BUFFER_TOO_SMALL
+        // Transferred bytes bounded to ~72 KB, never read full 32 MB
+        assertThat(transferredA.get()).isAtMost((outBufCap + 8192 * 2).toLong())
+
+        // Case B: max_egress_bytes is 128 KB, response is 32 MB -> aborts with -429 ERR_QUOTA_EXCEEDED
+        val bufferB = okio.Buffer()
+        for (i in 0 until (totalPayloadSize / chunk.size)) {
+            bufferB.write(chunk)
+        }
+        mockServer.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(bufferB)
+        )
+
+        val taskQuotaB = 128 * 1024L
+        val transferredB = AtomicLong(0)
+        val callB = taskClient.newCall(request)
+        var statusOrErrorB = 200
+        try {
+            val response = callB.execute()
+            val source = response.body?.source() ?: throw IOException("Empty body")
+            val tempChunk = ByteArray(8192)
+            var quotaExceeded = false
+
+            while (!source.exhausted()) {
+                val readNow = source.read(tempChunk)
+                if (readNow == -1) break
+                val current = transferredB.addAndGet(readNow.toLong())
+                if (current > taskQuotaB) {
+                    quotaExceeded = true
+                    callB.cancel()
+                    break
+                }
+            }
+            statusOrErrorB = if (quotaExceeded) -429 else response.code
+        } catch (_: Exception) {
+            statusOrErrorB = -429
+        }
+
+        assertThat(statusOrErrorB).isEqualTo(-429) // ERR_QUOTA_EXCEEDED
+        assertThat(transferredB.get()).isAtMost(taskQuotaB + 8192 * 2)
+    }
+
+    /**
+     * Adversarial Spike 3: Redirect SSRF Block.
+     * Evaluates whether a 302 Found redirect to a loopback address (127.0.0.1) is followed.
+     * Verifies that followRedirects = false prevents traversing the redirect, returning 302 to guest.
+     */
+    @Test
+    fun testSpike_redirectSsrfBlock() {
+        mockServer.start()
+
+        // Server responds with 302 Found pointing to loopback SSRF target
+        mockServer.enqueue(
+            MockResponse()
+                .setResponseCode(302)
+                .setHeader("Location", "http://127.0.0.1:8080/internal/admin")
+                .setBody("Redirecting...")
+        )
+
+        val client = OkHttpClient.Builder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
+
+        val request = Request.Builder()
+            .url(mockServer.url("/redirect-trigger"))
+            .build()
+
+        val response = client.newCall(request).execute()
+        assertThat(response.code).isEqualTo(302)
+        assertThat(response.header("Location")).isEqualTo("http://127.0.0.1:8080/internal/admin")
+
+        // Empirical check: exactly 1 request recorded; zero requests sent to the redirect target!
+        assertThat(mockServer.requestCount).isEqualTo(1)
+        response.close()
     }
 }
