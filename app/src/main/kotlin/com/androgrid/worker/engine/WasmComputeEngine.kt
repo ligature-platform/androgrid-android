@@ -39,8 +39,38 @@ import kotlin.coroutines.coroutineContext
  */
 class WasmComputeEngine(
     private val executionRunner: (suspend (ByteString, Map<String, String>) -> TaskExecutionResult)? = null,
-    private val computeDispatcher: CoroutineDispatcher = Dispatchers.Default
-) : ComputeEngine {
+    private val computeDispatcher: CoroutineDispatcher = Dispatchers.Default,
+    private val okHttpClient: okhttp3.OkHttpClient? = null,
+    private val dns: okhttp3.Dns = okhttp3.Dns.SYSTEM,
+    private val isMeteredProvider: () -> Boolean = { true },
+    private val propagateSecurityExceptions: Boolean = false,
+    private val allowLoopbackForTesting: Boolean = false
+) : ComputeEngine, AutoCloseable {
+
+    @Volatile
+    private var lazyOwnedClient: okhttp3.OkHttpClient? = null
+
+    private fun getEffectiveBaseClient(): okhttp3.OkHttpClient {
+        okHttpClient?.let { return it }
+        return lazyOwnedClient ?: synchronized(this) {
+            lazyOwnedClient ?: okhttp3.OkHttpClient.Builder()
+                .dns(dns)
+                .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                .followRedirects(false)
+                .followSslRedirects(false)
+                .connectionPool(okhttp3.ConnectionPool(4, 15, java.util.concurrent.TimeUnit.SECONDS))
+                .build().also { lazyOwnedClient = it }
+        }
+    }
+
+    override fun close() {
+        lazyOwnedClient?.let { client ->
+            client.dispatcher.executorService.shutdownNow()
+            client.connectionPool.evictAll()
+        }
+    }
 
     private class WasmCancelledTrap : RuntimeException("WASM execution cancelled")
 
@@ -80,6 +110,18 @@ class WasmComputeEngine(
             }
         }
 
+        // Step 2b: Enforce Metered Network Guard per [ANTI-003], [INV-003], [NFR-POW-001]
+        if (isMeteredProvider.invoke() && task.egressPolicy == com.androgrid.v1.NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST) {
+            if (propagateSecurityExceptions) {
+                throw SecurityException("Outbound network access over metered connection is forbidden per [INV-003] and [ANTI-003]")
+            }
+            return TaskExecutionResult.failure(
+                exitCode = -1,
+                errorCode = "METERED_NETWORK_REJECTED",
+                errorMessage = "Outbound network access over metered connection is forbidden per [INV-003] and [ANTI-003]"
+            )
+        }
+
         // Step 3: Enforce execution timeout watchdog with structured cancellation
         val callerJob = coroutineContext[Job]
         if (callerJob?.isActive == false) {
@@ -98,6 +140,7 @@ class WasmComputeEngine(
                             executionRunner.invoke(task.wasmBytecode, task.envVarsMap)
                         } else {
                             executeWasmInMemory(
+                                task = task,
                                 bytecode = task.wasmBytecode,
                                 envVars = task.envVarsMap,
                                 entrypoint = task.entrypoint,
@@ -106,6 +149,15 @@ class WasmComputeEngine(
                         }
                     } catch (e: CancellationException) {
                         throw e
+                    } catch (sec: SecurityException) {
+                        if (propagateSecurityExceptions) {
+                            throw sec
+                        }
+                        TaskExecutionResult.failure(
+                            exitCode = -1,
+                            errorCode = "SECURITY_VIOLATION",
+                            errorMessage = sec.message ?: "Security violation during WASM execution"
+                        )
                     } catch (t: Throwable) {
                         if (t is WasmCancelledTrap || t.cause is WasmCancelledTrap) {
                             throw CancellationException("WASM execution cancelled", t)
@@ -141,6 +193,7 @@ class WasmComputeEngine(
      * @return TaskExecutionResult with captured stdout, stderr, and exit status.
      */
     private fun executeWasmInMemory(
+        task: TaskSpec,
         bytecode: ByteString,
         envVars: Map<String, String>,
         entrypoint: String,
@@ -162,7 +215,26 @@ class WasmComputeEngine(
             .withOptions(wasiOptions)
             .build()
 
-        val store = Store().addFunction(*wasi.toHostFunctions())
+        val securityGuard = WasmNetworkEgressSecurityGuard(
+            dns = dns,
+            isMeteredProvider = isMeteredProvider,
+            allowLoopbackForTesting = allowLoopbackForTesting
+        )
+
+        val hostFunctions = mutableListOf<com.dylibso.chicory.runtime.HostFunction>()
+        hostFunctions.addAll(wasi.toHostFunctions())
+
+        if (task.egressPolicy == com.androgrid.v1.NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST) {
+            val egressModule = WasmNetworkEgressHostModule(
+                task = task,
+                securityGuard = securityGuard,
+                okHttpClient = getEffectiveBaseClient(),
+                executionJob = executionJob
+            )
+            hostFunctions.addAll(egressModule.toHostFunctions())
+        }
+
+        val store = Store().addFunction(*hostFunctions.toTypedArray())
 
         val rawBytes = bytecode.toByteArray()
 
@@ -290,7 +362,20 @@ class WasmComputeEngine(
                 val stdoutBytes = stdoutStream.toByteArray()
                 val stderrBytes = stderrStream.toByteArray()
                 val wasiExit = findWasiExitException(t)
-                if (wasiExit != null) {
+                val securityEx = findRootSecurityException(t)
+                if (securityEx != null) {
+                    if (propagateSecurityExceptions) {
+                        throw securityEx
+                    }
+                    val errorMsg = securityEx.message ?: "Security violation during WASM execution"
+                    TaskExecutionResult(
+                        exitCode = -1,
+                        stdoutBytes = stdoutBytes,
+                        stderrBytes = if (stderrBytes.isNotEmpty()) stderrBytes else errorMsg.toByteArray(Charsets.UTF_8),
+                        errorCode = "SECURITY_VIOLATION",
+                        errorMessage = errorMsg
+                    )
+                } else if (wasiExit != null) {
                     val code = wasiExit.exitCode()
                     if (code == 0) {
                         TaskExecutionResult(
@@ -331,6 +416,21 @@ class WasmComputeEngine(
             }
             completionHandle?.dispose()
         }
+    }
+
+    /**
+     * Traverses the exception cause hierarchy to identify any underlying SecurityException.
+     *
+     * @param throwable root or wrapped exception.
+     * @return SecurityException if present, or null.
+     */
+    private fun findRootSecurityException(throwable: Throwable): SecurityException? {
+        var current: Throwable? = throwable
+        while (current != null) {
+            if (current is SecurityException) return current
+            current = current.cause
+        }
+        return null
     }
 
     /**

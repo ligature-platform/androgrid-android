@@ -22,6 +22,7 @@ import com.androgrid.worker.enrollment.AndroidKeyStoreEnrollmentProvider
 import com.androgrid.worker.enrollment.CredentialLifecycleManager
 import com.androgrid.worker.enrollment.RenewalOutcome
 import com.androgrid.worker.engine.TaskExecutionDispatcher
+import com.androgrid.worker.engine.WasmComputeEngine
 import com.androgrid.worker.network.ArtifactResolver
 import com.androgrid.worker.network.CellularClaimOutcome
 import com.androgrid.worker.network.CellularTransportClient
@@ -54,14 +55,18 @@ class CellularSpotWorkerLogic(
     private val batteryProvider: BatteryStatusProvider,
     private val capabilityProvider: DeviceCapabilityProvider,
     private val cellularClient: CellularTransportClient = CellularTransportClient(),
-    private val dispatcher: TaskExecutionDispatcher = TaskExecutionDispatcher(),
+    private val dispatcher: TaskExecutionDispatcher = TaskExecutionDispatcher(wasmEngine = WasmComputeEngine(isMeteredProvider = { true })),
     private val channelProvider: (() -> ManagedChannel)? = null,
     private val thermalListener: DeviceThermalStatusListener? = null,
     private val thermalGuard: ThermalSafetyGuard = ThermalSafetyGuard(),
     private val ledgerRepository: TaskLedgerRepository? = null,
     private val upgradeManager: UpgradeManager? = null,
     private val downloadScheduler: ((NodeUpgradeDirective) -> Unit)? = null
-) {
+) : AutoCloseable {
+    override fun close() {
+        dispatcher.close()
+    }
+
     private suspend fun handleCellularUpgradeDirective(directive: NodeUpgradeDirective) {
         if (directive.networkPolicy == com.androgrid.v1.UpgradeNetworkPolicy.UPGRADE_NETWORK_POLICY_ALLOW_CELLULAR) {
             if (downloadScheduler != null) {
@@ -354,8 +359,12 @@ class CellularSpotWorker(
                 }
             )
 
-            val preClaimed = (renewalOutcome as? RenewalOutcome.Renewed<*>)?.trialResult as? CellularClaimOutcome
-            return workerLogic.executeSpotTask(preClaimed)
+            try {
+                val preClaimed = (renewalOutcome as? RenewalOutcome.Renewed<*>)?.trialResult as? CellularClaimOutcome
+                return workerLogic.executeSpotTask(preClaimed)
+            } finally {
+                workerLogic.close()
+            }
         } finally {
             thermalListener.stopListening()
             lifecycleManager.releaseGeneration(activeAlias)

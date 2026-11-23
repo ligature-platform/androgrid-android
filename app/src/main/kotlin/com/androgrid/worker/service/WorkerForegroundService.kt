@@ -8,6 +8,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -32,9 +34,11 @@ import com.androgrid.worker.enrollment.AndroidKeyStoreEnrollmentProvider
 import com.androgrid.worker.enrollment.CredentialLifecycleManager
 import com.androgrid.worker.enrollment.RenewalOutcome
 import com.androgrid.worker.engine.TaskExecutionDispatcher
+import com.androgrid.worker.engine.WasmComputeEngine
 import com.androgrid.worker.network.ArtifactResolution
 import com.androgrid.worker.network.ArtifactResolver
 import com.androgrid.worker.network.DefaultMtlsSocketFactoryProvider
+import com.androgrid.worker.network.NetworkRoute
 import com.androgrid.worker.network.OkHttpBlobFetcher
 import com.androgrid.worker.network.SharedPreferencesClusterSettingsRepository
 import com.androgrid.worker.network.WifiSyncClient
@@ -189,8 +193,28 @@ class WorkerForegroundService : Service() {
             val rootChecker = StandardRootChecker()
             val systemInfo = AndroidSystemInfoProvider(applicationContext)
             val capabilityProvider = DeviceCapabilityProvider(rootChecker, systemInfo)
-            val dispatcher = TaskExecutionDispatcher()
-            val app = application as? AndroGridApplication
+            val wasmEngine = WasmComputeEngine(
+                isMeteredProvider = {
+                    val app = application as? AndroGridApplication
+                    val monitor = app?.networkRouteMonitor
+                    val route = monitor?.currentRoute?.value
+                    if (route is NetworkRoute.LanConnected) {
+                        route.isMetered
+                    } else {
+                        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                        val activeNet = cm?.activeNetwork
+                        val caps = cm?.getNetworkCapabilities(activeNet)
+                        if (caps != null && (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))) {
+                            !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                        } else {
+                            true
+                        }
+                    }
+                }
+            )
+            val dispatcher = TaskExecutionDispatcher(wasmEngine = wasmEngine)
+            try {
+                val app = application as? AndroGridApplication
             val settingsRepo = app?.settingsRepository
                 ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
             val lifecycleManager = app?.credentialLifecycleManager
@@ -450,6 +474,9 @@ class WorkerForegroundService : Service() {
                         }
                     }
                 }
+            } finally {
+                dispatcher.close()
+            }
         }
     }
 
