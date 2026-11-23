@@ -374,6 +374,10 @@ class WasmNetworkEgressRobolectricTest {
         val mappedBroadcast = InetAddress.getByName("::ffff:255.255.255.255")
         val mappedMulticast = InetAddress.getByName("::ffff:224.0.0.1")
         val mappedPrivate = InetAddress.getByName("::ffff:192.168.1.1")
+        val benchmarkIp = InetAddress.getByName("198.18.0.1")
+        val nat64LocalUse = InetAddress.getByName("64:ff9b:1::1")
+        val sixToFour = InetAddress.getByName("2002:c0a8:0101::1")
+        val teredo = InetAddress.getByName("2001:0000:4136:e378:8000:63bf:3fff:fdd2")
 
         assertThat(guard.isDisallowedAddress(ulaAddress)).isTrue()
         assertThat(guard.isDisallowedAddress(ula2Address)).isTrue()
@@ -381,6 +385,10 @@ class WasmNetworkEgressRobolectricTest {
         assertThat(guard.isDisallowedAddress(mappedBroadcast)).isTrue()
         assertThat(guard.isDisallowedAddress(mappedMulticast)).isTrue()
         assertThat(guard.isDisallowedAddress(mappedPrivate)).isTrue()
+        assertThat(guard.isDisallowedAddress(benchmarkIp)).isTrue()
+        assertThat(guard.isDisallowedAddress(nat64LocalUse)).isTrue()
+        assertThat(guard.isDisallowedAddress(sixToFour)).isTrue()
+        assertThat(guard.isDisallowedAddress(teredo)).isTrue()
     }
 
     @Test
@@ -544,12 +552,15 @@ class WasmNetworkEgressRobolectricTest {
         }
         assertThat(exNull.message).contains("CRLF or control character injection")
 
-        // 3. Valid headers parsed cleanly
-        val validHeaders = "Accept: application/json\r\nX-Api-Key: secret123\nCache-Control: no-cache"
+        // 3. Valid headers parsed cleanly with multi-header preservation
+        val validHeaders = "Accept: application/json\r\nX-Api-Key: secret123\nCache-Control: no-cache\nAccept: text/plain"
         val parsed = guard.sanitizeHeaders(validHeaders)
-        assertThat(parsed["Accept"]).isEqualTo("application/json")
-        assertThat(parsed["X-Api-Key"]).isEqualTo("secret123")
-        assertThat(parsed["Cache-Control"]).isEqualTo("no-cache")
+        assertThat(parsed).containsExactly(
+            "Accept" to "application/json",
+            "X-Api-Key" to "secret123",
+            "Cache-Control" to "no-cache",
+            "Accept" to "text/plain"
+        )
     }
 
     @Test

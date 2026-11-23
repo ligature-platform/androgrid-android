@@ -98,6 +98,9 @@ class WasmNetworkEgressSecurityGuard(
             // RFC 6598 Carrier-Grade NAT (100.64.0.0/10)
             if (b0 == 100 && b1 in 64..127) return true
 
+            // RFC 2544 Benchmark Testing (198.18.0.0/15)
+            if (b0 == 198 && b1 in 18..19) return true
+
             // Link-local / Cloud metadata (169.254.0.0/16)
             if (b0 == 169 && b1 == 254) return true
 
@@ -125,6 +128,12 @@ class WasmNetworkEgressSecurityGuard(
             // IPv6 Multicast (ff00::/8)
             if (b0 == 0xFF) return true
 
+            // 6to4 Relay Anycast (2002::/16, RFC 3964)
+            if (b0 == 0x20 && b1 == 0x02) return true
+
+            // Teredo Tunneling (2001:0000::/32, RFC 4380)
+            if (b0 == 0x20 && b1 == 0x01 && raw[2] == 0x00.toByte() && raw[3] == 0x00.toByte()) return true
+
             // Unspecified address (::)
             if (raw.all { it == 0.toByte() }) return true
 
@@ -144,6 +153,12 @@ class WasmNetworkEgressSecurityGuard(
                 }
                 return isDisallowedAddress(mappedAddr)
             }
+
+            // NAT64 Local-Use Prefix (64:ff9b:1::/48, RFC 8215)
+            val isNat64LocalUse = raw[0] == 0x00.toByte() && raw[1] == 0x64.toByte() &&
+                    raw[2] == 0xFF.toByte() && raw[3] == 0x9B.toByte() &&
+                    raw[4] == 0x00.toByte() && raw[5] == 0x01.toByte()
+            if (isNat64LocalUse) return true
 
             // IPv4-mapped IPv6 checks (::ffff:a.b.c.d)
             val isIpv4Mapped = raw.take(10).all { it == 0.toByte() } &&
@@ -250,8 +265,8 @@ class WasmNetworkEgressSecurityGuard(
      * @return Parsed map of header names to values.
      * @throws SecurityException If forbidden headers or CRLF injection are detected.
      */
-    fun sanitizeHeaders(headersString: String): Map<String, String> {
-        if (headersString.isEmpty()) return emptyMap()
+    fun sanitizeHeaders(headersString: String): List<Pair<String, String>> {
+        if (headersString.isEmpty()) return emptyList()
 
         val bytes = headersString.toByteArray(Charsets.UTF_8)
         if (bytes.size > MAX_HEADERS_BYTES) {
@@ -260,7 +275,7 @@ class WasmNetworkEgressSecurityGuard(
             )
         }
 
-        val result = mutableMapOf<String, String>()
+        val result = mutableListOf<Pair<String, String>>()
         val lines = headersString.split("\r\n", "\n")
 
         for (line in lines) {
@@ -287,7 +302,7 @@ class WasmNetworkEgressSecurityGuard(
                 throw SecurityException("Forbidden hop-by-hop or framing header: '$key'")
             }
 
-            result[key] = value
+            result.add(key to value)
         }
 
         return result

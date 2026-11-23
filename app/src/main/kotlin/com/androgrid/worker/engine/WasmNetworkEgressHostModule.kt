@@ -50,8 +50,8 @@ class WasmNetworkEgressHostModule(
         .followRedirects(false)
         .followSslRedirects(false)
         .connectTimeout(minOf(10L, effectiveTimeoutSec()), java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(minOf(30L, effectiveTimeoutSec()), java.util.concurrent.TimeUnit.SECONDS)
-        .writeTimeout(minOf(30L, effectiveTimeoutSec()), java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(minOf(15L, effectiveTimeoutSec()), java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(minOf(15L, effectiveTimeoutSec()), java.util.concurrent.TimeUnit.SECONDS)
         .callTimeout(minOf(30L, effectiveTimeoutSec()), java.util.concurrent.TimeUnit.SECONDS)
         .build()
 
@@ -194,13 +194,6 @@ class WasmNetworkEgressHostModule(
             return ERR_SECURITY_VIOLATION
         }
 
-        // Bill request URL bytes against quota
-        val uLen = urlLen.toLong()
-        if (cumulativeBytesTransferred.get() + uLen > maxQuota) {
-            return ERR_QUOTA_EXCEEDED
-        }
-        cumulativeBytesTransferred.addAndGet(uLen)
-
         // 2. Read HTTP method (default to GET)
         val method = if (methodLen > 0) {
             try {
@@ -216,19 +209,12 @@ class WasmNetworkEgressHostModule(
         }
 
         // 3. Read and sanitize HTTP headers
-        val headersMap = if (headersLen > 0) {
+        val headersList = if (headersLen > 0) {
             val headersStr = try {
                 memory.readString(headersPtr, headersLen)
             } catch (e: Exception) {
                 return ERR_SECURITY_VIOLATION
             }
-
-            // Bill headers bytes against cumulative quota
-            val hLen = headersLen.toLong()
-            if (cumulativeBytesTransferred.get() + hLen > maxQuota) {
-                return ERR_QUOTA_EXCEEDED
-            }
-            cumulativeBytesTransferred.addAndGet(hLen)
 
             try {
                 securityGuard.sanitizeHeaders(headersStr)
@@ -238,7 +224,7 @@ class WasmNetworkEgressHostModule(
                 return ERR_SECURITY_VIOLATION
             }
         } else {
-            emptyMap()
+            emptyList()
         }
 
         // 4. Validate URL, scheme, allowlist, metered state, and pre-flight SSRF addresses
@@ -257,14 +243,9 @@ class WasmNetworkEgressHostModule(
             return ERR_IO_FAILURE
         }
 
-        // 5. Read request body bytes if present and bill against quota
-        val requestBodyBytes = if (bodyLen > 0) {
-            val reqBytes = bodyLen.toLong()
-            if (cumulativeBytesTransferred.get() + reqBytes > maxQuota) {
-                return ERR_QUOTA_EXCEEDED
-            }
-            cumulativeBytesTransferred.addAndGet(reqBytes)
-
+        // 5. Read request body bytes if present for methods that transmit body
+        val sendsBody = method in listOf("POST", "PUT", "PATCH")
+        val requestBodyBytes = if (bodyLen > 0 && sendsBody) {
             try {
                 memory.readBytes(bodyPtr, bodyLen)
             } catch (e: Exception) {
@@ -274,16 +255,30 @@ class WasmNetworkEgressHostModule(
             ByteArray(0)
         }
 
+        // 6. Check and bill outbound bytes (URL + headers + request body) ONLY after validation succeeds
+        val uLen = urlLen.toLong()
+        val hLen = headersLen.toLong()
+        val reqBytes = requestBodyBytes.size.toLong()
+        val totalOutboundBytes = uLen + hLen + reqBytes
+        if (cumulativeBytesTransferred.get() + totalOutboundBytes > maxQuota) {
+            return ERR_QUOTA_EXCEEDED
+        }
+        cumulativeBytesTransferred.addAndGet(totalOutboundBytes)
+
         val callRef = AtomicReference<Call?>(null)
         val completionHandle = executionJob?.invokeOnCompletion(onCancelling = true) { cause ->
             if (cause != null) {
                 callRef.get()?.cancel()
             }
         }
+        if (executionJob?.isActive == false) {
+            completionHandle?.dispose()
+            throw CancellationException("WASM outbound network request cancelled before start")
+        }
 
         return try {
-            // 6. Build OkHttp request with sanitized headers
-            val okRequestBody = if (method in listOf("POST", "PUT", "PATCH")) {
+            // 7. Build OkHttp request with sanitized headers
+            val okRequestBody = if (sendsBody) {
                 requestBodyBytes.toRequestBody(null)
             } else {
                 null
@@ -293,13 +288,17 @@ class WasmNetworkEgressHostModule(
                 .url(validatedUrl)
                 .method(method, okRequestBody)
 
-            for ((key, value) in headersMap) {
+            for ((key, value) in headersList) {
                 requestBuilder.addHeader(key, value)
             }
 
             val request = requestBuilder.build()
             val call = taskClient.newCall(request)
             callRef.set(call)
+            if (executionJob?.isActive == false) {
+                call.cancel()
+                throw CancellationException("WASM outbound network request cancelled before dispatch")
+            }
 
             call.execute().use { response ->
                 val responseHeadersBytes = response.headers.byteCount()
@@ -312,7 +311,7 @@ class WasmNetworkEgressHostModule(
                 val statusCode = response.code
                 val responseBody = response.body
                     ?: run {
-                        if (outWrittenPtr != 0) {
+                        if (outWrittenPtr >= 0) {
                             try {
                                 memory.writeI32(outWrittenPtr, 0)
                             } catch (_: Exception) {}
@@ -365,8 +364,8 @@ class WasmNetworkEgressHostModule(
                     cumulativeBytesTransferred.addAndGet(chunkBytes.size.toLong())
                 }
 
-                // Write exact byte count to out_written_ptr if non-zero
-                if (outWrittenPtr != 0) {
+                // Write exact byte count to out_written_ptr if non-negative
+                if (outWrittenPtr >= 0) {
                     try {
                         memory.writeI32(outWrittenPtr, totalBytesRead)
                     } catch (e: Exception) {
