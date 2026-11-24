@@ -396,11 +396,13 @@ class WorkerDashboardViewModelTest {
         override val isDiscovering: StateFlow<Boolean> = discoveringFlow
 
         override fun startDiscovery() {
+            if (discoveringFlow.value) return
             startCalls.incrementAndGet()
             discoveringFlow.value = true
         }
 
         override fun stopDiscovery() {
+            if (!discoveringFlow.value) return
             stopCalls.incrementAndGet()
             discoveringFlow.value = false
             clustersFlow.value = emptyList()

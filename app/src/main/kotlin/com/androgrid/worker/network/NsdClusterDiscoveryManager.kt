@@ -35,6 +35,14 @@ class NsdClusterDiscoveryManager(
         const val SERVICE_TYPE = "_androgrid._tcp"
         private const val MULTICAST_LOCK_TAG = "AndroGridClusterDiscovery"
         private const val MAX_RESOLVE_QUEUE_SIZE = 16
+        private const val MAX_DISCOVERED_CLUSTERS = 16
+    }
+
+    private enum class DiscoveryState {
+        STOPPED,
+        STARTING,
+        DISCOVERING,
+        STOPPING
     }
 
     private val multicastLock: WifiManager.MulticastLock? by lazy {
@@ -50,65 +58,124 @@ class NsdClusterDiscoveryManager(
     override val isDiscovering: StateFlow<Boolean> = _isDiscovering.asStateFlow()
 
     private val stateLock = Any()
+    private var discoveryState = DiscoveryState.STOPPED
     private var currentSessionId: Long = 0L
+    private var activeDiscoveryListener: NsdManager.DiscoveryListener? = null
     private var isResolving: Boolean = false
     private val resolveQueue = ArrayDeque<NsdServiceInfo>()
     private val pendingServiceNames = HashSet<String>()
 
-    private val discoveryListener = object : NsdManager.DiscoveryListener {
+    private inner class SessionDiscoveryListener(private val sessionId: Long) : NsdManager.DiscoveryListener {
         override fun onDiscoveryStarted(regType: String) {
-            Log.d(TAG, "mDNS discovery started for service type: $regType")
-            _isDiscovering.value = true
+            val shouldStopImmediately = synchronized(stateLock) {
+                if (sessionId != currentSessionId || discoveryState == DiscoveryState.STOPPING) {
+                    true
+                } else {
+                    discoveryState = DiscoveryState.DISCOVERING
+                    _isDiscovering.value = true
+                    Log.d(TAG, "mDNS discovery active for session $sessionId ($regType)")
+                    false
+                }
+            }
+
+            if (shouldStopImmediately) {
+                try {
+                    nsdManager?.stopServiceDiscovery(this)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error stopping cancelled discovery session: ${e.message}")
+                } finally {
+                    synchronized(stateLock) {
+                        if (sessionId == currentSessionId) {
+                            discoveryState = DiscoveryState.STOPPED
+                            _isDiscovering.value = false
+                            activeDiscoveryListener = null
+                        }
+                    }
+                    releaseMulticastLock()
+                }
+            }
         }
 
         override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-            Log.d(TAG, "Service found: ${serviceInfo.serviceName} (${serviceInfo.serviceType})")
-            val type = serviceInfo.serviceType ?: ""
-            if (type.contains("_androgrid._tcp", ignoreCase = true)) {
-                val session = synchronized(stateLock) { currentSessionId }
-                enqueueResolve(serviceInfo, session)
+            val session = synchronized(stateLock) {
+                if (sessionId == currentSessionId && discoveryState == DiscoveryState.DISCOVERING) {
+                    sessionId
+                } else {
+                    null
+                }
+            }
+            if (session != null) {
+                val type = serviceInfo.serviceType ?: ""
+                if (type.contains("_androgrid._tcp", ignoreCase = true)) {
+                    enqueueResolve(serviceInfo, session)
+                }
             }
         }
 
         override fun onServiceLost(serviceInfo: NsdServiceInfo) {
-            Log.d(TAG, "Service lost: ${serviceInfo.serviceName}")
-            val name = serviceInfo.serviceName ?: return
             synchronized(stateLock) {
-                pendingServiceNames.remove(name)
-            }
-            _discoveredClusters.update { list ->
-                list.filterNot { it.serviceName == name }
+                if (sessionId == currentSessionId) {
+                    val name = serviceInfo.serviceName ?: return
+                    pendingServiceNames.remove(name)
+                    _discoveredClusters.update { list ->
+                        list.filterNot { it.serviceName == name }
+                    }
+                }
             }
         }
 
         override fun onDiscoveryStopped(serviceType: String) {
-            Log.d(TAG, "mDNS discovery stopped for service type: $serviceType")
-            _isDiscovering.value = false
+            Log.d(TAG, "mDNS discovery stopped for session $sessionId")
+            synchronized(stateLock) {
+                if (sessionId == currentSessionId) {
+                    discoveryState = DiscoveryState.STOPPED
+                    _isDiscovering.value = false
+                    activeDiscoveryListener = null
+                    resolveQueue.clear()
+                    pendingServiceNames.clear()
+                    isResolving = false
+                }
+            }
             releaseMulticastLock()
         }
 
         override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
-            Log.e(TAG, "Start mDNS discovery failed: errorCode=$errorCode")
-            _isDiscovering.value = false
+            Log.e(TAG, "Start mDNS discovery failed for session $sessionId: errorCode=$errorCode")
+            synchronized(stateLock) {
+                if (sessionId == currentSessionId) {
+                    discoveryState = DiscoveryState.STOPPED
+                    _isDiscovering.value = false
+                    activeDiscoveryListener = null
+                }
+            }
             releaseMulticastLock()
         }
 
         override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
-            Log.e(TAG, "Stop mDNS discovery failed: errorCode=$errorCode")
-            _isDiscovering.value = false
+            Log.e(TAG, "Stop mDNS discovery failed for session $sessionId: errorCode=$errorCode")
+            synchronized(stateLock) {
+                if (sessionId == currentSessionId) {
+                    discoveryState = DiscoveryState.STOPPED
+                    _isDiscovering.value = false
+                    activeDiscoveryListener = null
+                }
+            }
             releaseMulticastLock()
         }
     }
 
     override fun startDiscovery() {
-        val sessionId: Long
-        synchronized(stateLock) {
-            if (_isDiscovering.value) {
-                Log.d(TAG, "mDNS discovery already active; ignoring start request")
+        val (sessionId, listener) = synchronized(stateLock) {
+            if (discoveryState == DiscoveryState.STARTING || discoveryState == DiscoveryState.DISCOVERING) {
+                Log.d(TAG, "mDNS discovery already active or starting; ignoring start request")
                 return
             }
             currentSessionId++
-            sessionId = currentSessionId
+            val sid = currentSessionId
+            discoveryState = DiscoveryState.STARTING
+            val l = SessionDiscoveryListener(sid)
+            activeDiscoveryListener = l
+            sid to l
         }
 
         acquireMulticastLock()
@@ -116,17 +183,26 @@ class NsdClusterDiscoveryManager(
         val nsd = nsdManager
         if (nsd == null) {
             Log.w(TAG, "NsdManager is null on this platform; discovery unavailable")
+            synchronized(stateLock) {
+                if (currentSessionId == sessionId) {
+                    discoveryState = DiscoveryState.STOPPED
+                    _isDiscovering.value = false
+                    activeDiscoveryListener = null
+                }
+            }
             releaseMulticastLock()
             return
         }
 
         try {
-            nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
+            nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initiate mDNS service discovery: ${e.message}", e)
             synchronized(stateLock) {
                 if (currentSessionId == sessionId) {
+                    discoveryState = DiscoveryState.STOPPED
                     _isDiscovering.value = false
+                    activeDiscoveryListener = null
                 }
             }
             releaseMulticastLock()
@@ -134,24 +210,42 @@ class NsdClusterDiscoveryManager(
     }
 
     override fun stopDiscovery() {
+        val listenerToStop: NsdManager.DiscoveryListener?
         synchronized(stateLock) {
-            if (!_isDiscovering.value) {
+            if (discoveryState == DiscoveryState.STOPPED) {
                 return
             }
             currentSessionId++
             resolveQueue.clear()
             pendingServiceNames.clear()
             isResolving = false
+
+            if (discoveryState == DiscoveryState.STARTING) {
+                // Cancelled during the STARTING window before OS onDiscoveryStarted
+                discoveryState = DiscoveryState.STOPPING
+                _isDiscovering.value = false
+                listenerToStop = null
+            } else {
+                discoveryState = DiscoveryState.STOPPING
+                _isDiscovering.value = false
+                listenerToStop = activeDiscoveryListener
+            }
         }
 
-        try {
-            nsdManager?.stopServiceDiscovery(discoveryListener)
-        } catch (e: Exception) {
-            Log.w(TAG, "Error stopping mDNS service discovery: ${e.message}")
-        } finally {
-            _isDiscovering.value = false
-            releaseMulticastLock()
-            _discoveredClusters.value = emptyList()
+        _discoveredClusters.value = emptyList()
+
+        if (listenerToStop != null) {
+            try {
+                nsdManager?.stopServiceDiscovery(listenerToStop)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error stopping mDNS service discovery: ${e.message}")
+            } finally {
+                synchronized(stateLock) {
+                    discoveryState = DiscoveryState.STOPPED
+                    activeDiscoveryListener = null
+                }
+                releaseMulticastLock()
+            }
         }
     }
 
@@ -315,7 +409,7 @@ class NsdClusterDiscoveryManager(
 
         _discoveredClusters.update { list ->
             val updated = list.filterNot { it.serviceName == serviceName || it.endpoint() == cluster.endpoint() }
-            updated + cluster
+            (listOf(cluster) + updated).take(MAX_DISCOVERED_CLUSTERS)
         }
     }
 }

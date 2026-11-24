@@ -179,13 +179,9 @@ class WorkerDashboardViewModel(
             !_uiState.value.isConfigured
 
         if (shouldDiscover) {
-            if (discoveryManager?.isDiscovering?.value != true) {
-                discoveryManager?.startDiscovery()
-            }
+            discoveryManager?.startDiscovery()
         } else {
-            if (discoveryManager?.isDiscovering?.value != false) {
-                discoveryManager?.stopDiscovery()
-            }
+            discoveryManager?.stopDiscovery()
         }
     }
 
@@ -196,9 +192,7 @@ class WorkerDashboardViewModel(
 
     fun onUiStopped() {
         isUiVisible = false
-        if (discoveryManager?.isDiscovering?.value != false) {
-            discoveryManager?.stopDiscovery()
-        }
+        discoveryManager?.stopDiscovery()
     }
 
     /**

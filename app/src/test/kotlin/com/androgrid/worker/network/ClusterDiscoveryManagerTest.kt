@@ -191,6 +191,9 @@ class ClusterDiscoveryManagerTest {
 
     @Test
     fun testFailureCallbacks_handledWithoutCrashing() {
+        val listeners = mutableListOf<NsdManager.DiscoveryListener>()
+        every { mockNsdManager.discoverServices(any(), any(), capture(listeners)) } returns Unit
+
         val manager = NsdClusterDiscoveryManager(
             context = ApplicationProvider.getApplicationContext(),
             nsdManager = mockNsdManager,
@@ -198,27 +201,28 @@ class ClusterDiscoveryManagerTest {
         )
 
         manager.startDiscovery()
-        verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
-        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
+        assertThat(listeners).hasSize(1)
+        listeners[0].onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
 
         every { mockMulticastLock.isHeld } returns true
 
-        discoveryListenerSlot.captured.onStartDiscoveryFailed("_androgrid._tcp", NsdManager.FAILURE_INTERNAL_ERROR)
+        listeners[0].onStartDiscoveryFailed("_androgrid._tcp", NsdManager.FAILURE_INTERNAL_ERROR)
         assertThat(manager.isDiscovering.value).isFalse()
         verify { mockMulticastLock.release() }
 
-        discoveryListenerSlot.captured.onStopDiscoveryFailed("_androgrid._tcp", NsdManager.FAILURE_INTERNAL_ERROR)
+        listeners[0].onStopDiscoveryFailed("_androgrid._tcp", NsdManager.FAILURE_INTERNAL_ERROR)
         assertThat(manager.isDiscovering.value).isFalse()
 
         // Re-start discovery to test resolve failure handling during active session
         manager.startDiscovery()
-        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
+        assertThat(listeners).hasSize(2)
+        listeners[1].onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
 
         val service = NsdServiceInfo().apply {
             serviceName = "faulty"
             serviceType = "_androgrid._tcp"
         }
-        discoveryListenerSlot.captured.onServiceFound(service)
+        listeners[1].onServiceFound(service)
         verify { mockNsdManager.resolveService(service, capture(resolveListenerSlot)) }
         resolveListenerSlot.captured.onResolveFailed(service, NsdManager.FAILURE_INTERNAL_ERROR)
 
@@ -360,5 +364,206 @@ class ClusterDiscoveryManagerTest {
         val clusters = manager.discoveredClusters.value
         assertThat(clusters).hasSize(1)
         assertThat(clusters[0].caFingerprint).isEmpty()
+    }
+
+    @Test
+    fun testResolveQueue_serializesMultipleAnnouncements_fifoOrder() {
+        val manager = NsdClusterDiscoveryManager(
+            context = ApplicationProvider.getApplicationContext(),
+            nsdManager = mockNsdManager,
+            wifiManager = mockWifiManager
+        )
+
+        val resolveSlots = mutableListOf<NsdManager.ResolveListener>()
+        every { mockNsdManager.resolveService(any(), capture(resolveSlots)) } returns Unit
+
+        manager.startDiscovery()
+        verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
+
+        val svcA = NsdServiceInfo().apply {
+            serviceName = "cluster-a"
+            serviceType = "_androgrid._tcp"
+        }
+        val svcB = NsdServiceInfo().apply {
+            serviceName = "cluster-b"
+            serviceType = "_androgrid._tcp"
+        }
+
+        // Announce service A then service B back-to-back
+        discoveryListenerSlot.captured.onServiceFound(svcA)
+        discoveryListenerSlot.captured.onServiceFound(svcB)
+
+        // Only service A should be resolving; service B must wait in queue
+        verify(exactly = 1) { mockNsdManager.resolveService(svcA, any()) }
+        verify(exactly = 0) { mockNsdManager.resolveService(svcB, any()) }
+
+        // Complete service A resolution
+        val resolvedA = NsdServiceInfo().apply {
+            serviceName = "cluster-a"
+            serviceType = "_androgrid._tcp"
+            host = InetAddress.getByName("192.168.1.10")
+            port = 50051
+        }
+        resolveSlots.last().onServiceResolved(resolvedA)
+
+        // Service B must now be popped from queue and invoked
+        verify(exactly = 1) { mockNsdManager.resolveService(svcB, any()) }
+
+        // Complete service B resolution
+        val resolvedB = NsdServiceInfo().apply {
+            serviceName = "cluster-b"
+            serviceType = "_androgrid._tcp"
+            host = InetAddress.getByName("192.168.1.20")
+            port = 50051
+        }
+        resolveSlots.last().onServiceResolved(resolvedB)
+
+        assertThat(manager.discoveredClusters.value).hasSize(2)
+    }
+
+    @Test
+    fun testResolveQueue_deduplicatesPendingServiceNames() {
+        val manager = NsdClusterDiscoveryManager(
+            context = ApplicationProvider.getApplicationContext(),
+            nsdManager = mockNsdManager,
+            wifiManager = mockWifiManager
+        )
+
+        val resolveSlots = mutableListOf<NsdManager.ResolveListener>()
+        every { mockNsdManager.resolveService(any(), capture(resolveSlots)) } returns Unit
+
+        manager.startDiscovery()
+        verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
+
+        val service = NsdServiceInfo().apply {
+            serviceName = "cluster-dup"
+            serviceType = "_androgrid._tcp"
+        }
+
+        // Announce same service twice while first is still resolving
+        discoveryListenerSlot.captured.onServiceFound(service)
+        discoveryListenerSlot.captured.onServiceFound(service)
+
+        val resolved = NsdServiceInfo().apply {
+            serviceName = "cluster-dup"
+            serviceType = "_androgrid._tcp"
+            host = InetAddress.getByName("192.168.1.15")
+            port = 50051
+        }
+        resolveSlots.last().onServiceResolved(resolved)
+
+        // resolveService must be called exactly once for cluster-dup
+        verify(exactly = 1) { mockNsdManager.resolveService(service, any()) }
+    }
+
+    @Test
+    fun testResolveQueue_dropsWhenQueueCapacityExceeded() {
+        val manager = NsdClusterDiscoveryManager(
+            context = ApplicationProvider.getApplicationContext(),
+            nsdManager = mockNsdManager,
+            wifiManager = mockWifiManager
+        )
+
+        val resolveSlots = mutableListOf<NsdManager.ResolveListener>()
+        every { mockNsdManager.resolveService(any(), capture(resolveSlots)) } returns Unit
+
+        manager.startDiscovery()
+        verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
+
+        // First service starts resolving immediately
+        val svc0 = NsdServiceInfo().apply {
+            serviceName = "cluster-0"
+            serviceType = "_androgrid._tcp"
+        }
+        discoveryListenerSlot.captured.onServiceFound(svc0)
+
+        // Next 16 services fill the resolve queue (capacity = 16)
+        for (i in 1..16) {
+            val svc = NsdServiceInfo().apply {
+                serviceName = "cluster-$i"
+                serviceType = "_androgrid._tcp"
+            }
+            discoveryListenerSlot.captured.onServiceFound(svc)
+        }
+
+        // 17th queued service (cluster-17) must be dropped due to queue overflow
+        val overflowSvc = NsdServiceInfo().apply {
+            serviceName = "cluster-17"
+            serviceType = "_androgrid._tcp"
+        }
+        discoveryListenerSlot.captured.onServiceFound(overflowSvc)
+
+        // Complete svc0
+        val resolved0 = NsdServiceInfo().apply {
+            serviceName = "cluster-0"
+            serviceType = "_androgrid._tcp"
+            host = InetAddress.getByName("192.168.1.100")
+            port = 50051
+        }
+        resolveSlots.first().onServiceResolved(resolved0)
+
+        // cluster-17 must never have been resolved
+        verify(exactly = 0) { mockNsdManager.resolveService(overflowSvc, any()) }
+    }
+
+    @Test
+    fun testStartingState_stopDuringStartingWindow_cancelsSessionAndReleasesLock() {
+        val manager = NsdClusterDiscoveryManager(
+            context = ApplicationProvider.getApplicationContext(),
+            nsdManager = mockNsdManager,
+            wifiManager = mockWifiManager
+        )
+
+        // 1. Call startDiscovery: transitions to STARTING
+        manager.startDiscovery()
+        verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        verify { mockMulticastLock.acquire() }
+
+        every { mockMulticastLock.isHeld } returns true
+
+        // 2. Before onDiscoveryStarted arrives, stopDiscovery is called
+        manager.stopDiscovery()
+        assertThat(manager.isDiscovering.value).isFalse()
+
+        // 3. Late onDiscoveryStarted arrives from OS binder
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
+
+        // Must immediately call stopServiceDiscovery and release MulticastLock
+        verify { mockNsdManager.stopServiceDiscovery(discoveryListenerSlot.captured) }
+        verify { mockMulticastLock.release() }
+        assertThat(manager.isDiscovering.value).isFalse()
+    }
+
+    @Test
+    fun testDiscoveredClusters_boundedAtCapacity() {
+        val manager = NsdClusterDiscoveryManager(
+            context = ApplicationProvider.getApplicationContext(),
+            nsdManager = mockNsdManager,
+            wifiManager = mockWifiManager
+        )
+
+        val resolveSlots = mutableListOf<NsdManager.ResolveListener>()
+        every { mockNsdManager.resolveService(any(), capture(resolveSlots)) } returns Unit
+
+        manager.startDiscovery()
+        verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
+
+        for (i in 1..20) {
+            val svc = NsdServiceInfo().apply {
+                serviceName = "node-$i"
+                serviceType = "_androgrid._tcp"
+                host = InetAddress.getByName("192.168.1.$i")
+                port = 50051
+            }
+            discoveryListenerSlot.captured.onServiceFound(svc)
+            resolveSlots.last().onServiceResolved(svc)
+        }
+
+        // Must be capped at 16
+        assertThat(manager.discoveredClusters.value).hasSize(16)
     }
 }
