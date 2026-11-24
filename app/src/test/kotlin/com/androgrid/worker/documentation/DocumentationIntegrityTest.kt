@@ -168,6 +168,7 @@ class DocumentationIntegrityTest {
 
         val content = matrixFile.readText(Charsets.UTF_8)
         assertThat(content).contains("ISO/IEC/IEEE 29148")
+        assertThat(content).contains("ADR-012")
 
         val requiredRequirementTags = listOf(
             "[REQ-OP-001]",
