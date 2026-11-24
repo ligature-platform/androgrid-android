@@ -6,6 +6,7 @@ import com.androgrid.worker.capability.BatteryStatusProvider
 import com.androgrid.worker.capability.DeviceCapabilityProvider
 import com.androgrid.worker.capability.RootChecker
 import com.androgrid.worker.capability.SystemInfoProvider
+import com.androgrid.worker.network.InMemoryClusterSettingsRepository
 import com.androgrid.worker.network.NetworkRoute
 import com.androgrid.worker.service.ServiceController
 import com.androgrid.worker.service.WorkScheduler
@@ -422,9 +423,9 @@ class WorkerDashboardViewModelTest {
         )
         testScheduler.advanceUntilIdle()
 
-        // Initially offline: discovery not started, stop was invoked on offline state
+        // Initially offline: discovery not started
         assertThat(fakeDiscovery.startCalls.get()).isEqualTo(0)
-        assertThat(fakeDiscovery.stopCalls.get()).isEqualTo(1)
+        assertThat(fakeDiscovery.stopCalls.get()).isEqualTo(0)
 
         // Route transitions to Wi-Fi LAN: discovery automatically activated
         routeFlow.value = NetworkRoute.LanConnected(isMetered = false)
@@ -450,8 +451,66 @@ class WorkerDashboardViewModelTest {
         // Route switches to metered Cellular WAN: discovery automatically halted
         routeFlow.value = NetworkRoute.CellularWan(isMetered = true)
         testScheduler.advanceUntilIdle()
-        assertThat(fakeDiscovery.stopCalls.get()).isEqualTo(2)
+        assertThat(fakeDiscovery.stopCalls.get()).isEqualTo(1)
         assertThat(viewModel.discoveredClusters.value).isEmpty()
         assertThat(viewModel.uiState.value.discoveredClusters).isEmpty()
+    }
+
+    @Test
+    fun testDiscoveryManager_doesNotStartWhenDeviceIsAlreadyConfigured() = runTest {
+        val routeFlow = MutableStateFlow<NetworkRoute>(NetworkRoute.LanConnected(isMetered = false))
+        val fakeDiscovery = FakeClusterDiscoveryManager()
+        val coordinator = WorkerLifecycleCoordinator(routeFlow, RecordingServiceController(), RecordingWorkScheduler())
+        val repo = InMemoryClusterSettingsRepository().apply {
+            updateCertificates("CA_CERT", "CLIENT_CERT", "CLIENT_KEY")
+        }
+
+        val viewModel = WorkerDashboardViewModel(
+            nodeId = "node_configured_test",
+            routeFlow = routeFlow,
+            capabilityProvider = DeviceCapabilityProvider(FakeRootChecker(), FakeSystemInfo()),
+            batteryProvider = FakeBatteryProvider(),
+            coordinator = coordinator,
+            discoveryManager = fakeDiscovery,
+            settingsRepository = repo
+        )
+        testScheduler.advanceUntilIdle()
+
+        // Configured node must never start mDNS discovery, even on LAN
+        assertThat(viewModel.uiState.value.isConfigured).isTrue()
+        assertThat(fakeDiscovery.startCalls.get()).isEqualTo(0)
+    }
+
+    @Test
+    fun testDiscoveryManager_stopsWhenUiGoesToBackground() = runTest {
+        val routeFlow = MutableStateFlow<NetworkRoute>(NetworkRoute.LanConnected(isMetered = false))
+        val fakeDiscovery = FakeClusterDiscoveryManager()
+        val coordinator = WorkerLifecycleCoordinator(routeFlow, RecordingServiceController(), RecordingWorkScheduler())
+        val repo = InMemoryClusterSettingsRepository()
+
+        val viewModel = WorkerDashboardViewModel(
+            nodeId = "node_lifecycle_test",
+            routeFlow = routeFlow,
+            capabilityProvider = DeviceCapabilityProvider(FakeRootChecker(), FakeSystemInfo()),
+            batteryProvider = FakeBatteryProvider(),
+            coordinator = coordinator,
+            discoveryManager = fakeDiscovery,
+            settingsRepository = repo
+        )
+        testScheduler.advanceUntilIdle()
+
+        // Unconfigured on LAN: discovery started initially
+        assertThat(fakeDiscovery.startCalls.get()).isEqualTo(1)
+        assertThat(fakeDiscovery.stopCalls.get()).isEqualTo(0)
+
+        // Activity backgrounded: onUiStopped called
+        viewModel.onUiStopped()
+        testScheduler.advanceUntilIdle()
+        assertThat(fakeDiscovery.stopCalls.get()).isEqualTo(1)
+
+        // Activity returned to foreground: onUiStarted called
+        viewModel.onUiStarted()
+        testScheduler.advanceUntilIdle()
+        assertThat(fakeDiscovery.startCalls.get()).isEqualTo(2)
     }
 }
