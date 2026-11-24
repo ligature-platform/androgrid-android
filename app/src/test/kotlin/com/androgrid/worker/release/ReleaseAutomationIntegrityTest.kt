@@ -1,7 +1,12 @@
 package com.androgrid.worker.release
 
+import android.graphics.BitmapFactory
+import com.androgrid.worker.enrollment.QrCodeDecoder
 import com.google.common.truth.Truth.assertThat
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import java.io.File
 
 /**
@@ -10,6 +15,8 @@ import java.io.File
  *
  * Traces to: AG-SPEC-2026-V2, [REQ-VER-001], [REQ-VER-002], [NFR-PERF-001]
  */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34])
 class ReleaseAutomationIntegrityTest {
 
     private fun getProjectRootDir(): File {
@@ -53,12 +60,21 @@ class ReleaseAutomationIntegrityTest {
         assertThat(content).contains("androgrid-worker.apk")
         assertThat(content).contains("download-qr.png")
 
+        // Verify fail-closed apksigner verification and environment-based keytool password
+        assertThat(content).contains("storepass:env RELEASE_KEYSTORE_PASSWORD")
+        assertThat(content).contains("apksigner")
+        assertThat(content).doesNotContain("|| true")
+
+        // Verify 25 MB APK size boundary check
+        assertThat(content).contains("25 * 1024 * 1024")
+
         // Verify release upload / publication
         assertThat(content).contains("gh release")
     }
 
     /**
-     * Validates that mobile download QR code assets exist and are embedded into README.md.
+     * Validates that mobile download QR code assets exist, decode programmatically to the
+     * canonical release URL via ZXing, and are properly referenced in README.md.
      *
      * Traces to: [REQ-OP-001], Issue #67
      */
@@ -70,10 +86,22 @@ class ReleaseAutomationIntegrityTest {
         val qrSvg = File(assetsDir, "download-qr.svg")
 
         assertThat(qrPng.exists()).isTrue()
-        assertThat(qrPng.length()).isGreaterThan(100L)
+        assertThat(qrPng.length()).isGreaterThan(500L)
+
+        // Programmatically decode QR PNG content via QrCodeDecoder to guarantee URL integrity
+        val bitmap = BitmapFactory.decodeFile(qrPng.absolutePath)
+        assertThat(bitmap).isNotNull()
+        val decodedUrl = QrCodeDecoder.decodeBitmap(bitmap)
+
+        assertThat(decodedUrl).isEqualTo(
+            "https://github.com/ligature-platform/androgrid-android/releases/latest/download/androgrid-worker.apk"
+        )
 
         assertThat(qrSvg.exists()).isTrue()
-        assertThat(qrSvg.length()).isGreaterThan(100L)
+        assertThat(qrSvg.length()).isGreaterThan(500L)
+        val svgContent = qrSvg.readText(Charsets.UTF_8)
+        assertThat(svgContent).contains("<svg")
+        assertThat(svgContent).contains("</svg>")
 
         val readmeFile = File(rootDir, "README.md")
         assertThat(readmeFile.exists()).isTrue()
@@ -85,10 +113,10 @@ class ReleaseAutomationIntegrityTest {
     }
 
     /**
-     * Validates that app/build.gradle.kts bounds native ABI to arm64-v8a for alpha releases
-     * enforcing the 25 MB package bound and 16 KB page-size alignment per Android 15.
+     * Validates that app/build.gradle.kts bounds release native ABI to arm64-v8a for alpha distribution
+     * keeping release APK size under 25 MB while preserving debug builds for developer emulators.
      *
-     * Traces to: [REQ-VER-001], [NFR-PERF-001], Issue #67
+     * Traces to: [REQ-VER-001], Issue #67
      */
     @Test
     fun testHardwareScopeArm64AbiFilterBound() {
