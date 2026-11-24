@@ -8,9 +8,8 @@ Traceability: `[REQ-OP-001]`, `[REQ-OP-002]`, `[REQ-OP-003]`, `[REQ-VER-001]`, `
 
 ## Device Prerequisites & Compatibility Matrix
 
-> [!IMPORTANT]
-> **Alpha Promotion Hardware Boundary Notice:**
-> The public alpha release APK distribution (`androgrid-worker-v0.0.1-alpha.5.apk`) is explicitly bounded to **Android 12+ (API 31+) ARM64 (`arm64-v8a`)** devices. This hardware boundary enforces 16 KB page-size ELF alignment per Android 15 compatibility guidelines, eliminates legacy crypto provider friction, and keeps binary package footprints under 25 MB (`[NFR-PERF-001]`). The core codebase maintains minimum SDK 28 (Android 9 Pie) compatibility (`[REQ-VER-002]`) for custom source builds.
+**Alpha Promotion Hardware Boundary Notice:**
+The public alpha release APK distribution (`androgrid-worker.apk`) is explicitly targeted to **Android 12+ (API 31+) ARM64 (`arm64-v8a`)** physical devices. This hardware boundary enforces 16 KB page-size ELF alignment per Android 15 compatibility guidelines, eliminates legacy crypto provider friction, and keeps binary package footprints under 25 MB. The core codebase maintains minimum SDK 28 (Android 9 Pie) compatibility (`[REQ-VER-002]`) for custom source builds.
 
 Before enrolling a device, verify that it meets the following hardware and operating system requirements:
 
@@ -31,13 +30,9 @@ Before enrolling a device, verify that it meets the following hardware and opera
 
 For alpha testers and standalone physical devices, install the worker application directly from GitHub Releases without developer tools:
 
-<p align="center">
-  <img src="assets/download-qr.png" alt="Scan to Download AndroGrid Worker APK" width="180" height="180" />
-  <br />
-  <a href="https://github.com/ligature-platform/androgrid-android/releases/latest/download/androgrid-worker.apk">
-    <strong>Direct Download: androgrid-worker.apk (Permanent Latest Release)</strong>
-  </a>
-</p>
+![Scan to Download AndroGrid Worker APK](assets/download-qr.png)
+
+[**Direct Download: androgrid-worker.apk (Permanent Latest Release)**](https://github.com/ligature-platform/androgrid-android/releases/latest/download/androgrid-worker.apk)
 
 1. **Step 1: Scan QR Code and Tap "Download":**
    - Point your phone camera or QR scanner at the code above, or tap the direct download link in your mobile browser.
@@ -208,8 +203,8 @@ Android device manufacturers (OEMs) implement aggressive proprietary battery man
 - Under **Battery saver**, select **No restrictions**.
 - In the Recents app switcher, long-press AndroGrid Worker and tap the **Lock icon** to prevent task clearance.
 - **Troubleshooting HyperOS Process Eviction:**
-  - On Xiaomi devices running HyperOS, navigate to **Settings** -> **Additional settings** -> **Developer options** and verify **MIUI / System optimizations** are not aggressively killing sticky foreground services.
-  - If OTA background download jobs fail to awaken, navigate to **Security** app -> **Manage apps** -> **Permissions** -> **Autostart in background** and enable AndroGrid Worker.
+  - In the **Security** app -> **Manage apps** -> **Permissions** -> **Autostart in background**, ensure AndroGrid Worker is enabled.
+  - Avoid toggling off MIUI / System optimizations in Developer Options; on modern HyperOS builds, disabling system optimizations can break the Android system package installer and runtime permission dialogs, blocking subsequent OTA updates.
 
 ### 3. Huawei / Honor (EMUI & MagicOS)
 - Open **Settings** -> **Battery** -> **App Launch**.
@@ -260,3 +255,7 @@ This eliminates world-readable filesystem staging risks and guarantees atomic in
 ### 3. Signing Lineage & Rollback Protection
 - **Pre-Install Signature Verification:** APK signatures are checked against the installed certificate lineage before initiating root shell commands. Mismatched or corrupted APKs are rejected immediately.
 - **Anti-Rollback Enforcement:** Production builds strictly omit the `-d` downgrade flag, enforcing monotonic platform version increments.
+
+### 4. Direct Cluster Blob Hosting vs. GitHub 302 Redirect Policy
+- **Cluster Artifact Store:** Declarative OTA node upgrades are dispatched over cluster control plane directives (`NodeUpgradeDirective`) referencing the cluster artifact store (`/v1/blobs/<sha256>`).
+- **SSRF and Redirect Prevention:** `UpgradeManager.downloadApkStream()` strictly disables HTTP redirects (`followRedirects(false)`) to protect against Server-Side Request Forgery (SSRF) and transport hijacking. Because GitHub Release download URLs issue HTTP 302 redirects, OTA directives must always target the authoritative cluster blob endpoint rather than external redirecting URLs. GitHub Releases serves strictly as the initial manual sideloading channel for human testers.
