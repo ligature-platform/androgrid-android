@@ -48,7 +48,8 @@ class WasmNetworkEgressSecurityGuard(
             "te",
             "trailer",
             "proxy-authorization",
-            "proxy-authenticate"
+            "proxy-authenticate",
+            "expect"
         )
 
         val FORBIDDEN_WILDCARD_SUFFIXES: Set<String> = setOf(
@@ -57,6 +58,8 @@ class WasmNetworkEgressSecurityGuard(
             "co.za", "de", "fr", "nl", "ru", "cn", "in", "uk", "au", "ca", "jp", "eu",
             "ai", "app", "dev", "xyz", "cloud", "workers.dev", "amazonaws.com", "github.io"
         )
+
+        val IPV4_LITERAL_REGEX: Regex = Regex("^(\\d{1,3}\\.){3}\\d{1,3}$")
     }
 
     /**
@@ -98,6 +101,18 @@ class WasmNetworkEgressSecurityGuard(
             // RFC 6598 Carrier-Grade NAT (100.64.0.0/10)
             if (b0 == 100 && b1 in 64..127) return true
 
+            // RFC 6890 / RFC 5736 IETF Protocol Assignments (192.0.0.0/24)
+            val b2 = raw[2].toInt() and 0xFF
+            if (b0 == 192 && b1 == 0 && b2 == 0) return true
+
+            // RFC 5737 Documentation (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)
+            if (b0 == 192 && b1 == 0 && b2 == 2) return true
+            if (b0 == 198 && b1 == 51 && b2 == 100) return true
+            if (b0 == 203 && b1 == 0 && b2 == 113) return true
+
+            // RFC 3068 6to4 Relay Anycast (192.88.99.0/24)
+            if (b0 == 192 && b1 == 88 && b2 == 99) return true
+
             // RFC 2544 Benchmark Testing (198.18.0.0/15)
             if (b0 == 198 && b1 in 18..19) return true
 
@@ -134,11 +149,33 @@ class WasmNetworkEgressSecurityGuard(
             // Teredo Tunneling (2001:0000::/32, RFC 4380)
             if (b0 == 0x20 && b1 == 0x01 && raw[2] == 0x00.toByte() && raw[3] == 0x00.toByte()) return true
 
+            // RFC 3849 Documentation (2001:db8::/32)
+            if (b0 == 0x20 && b1 == 0x01 && (raw[2].toInt() and 0xFF) == 0x0D && (raw[3].toInt() and 0xFF) == 0xB8) return true
+
+            // RFC 6666 Discard-Only Address Block (100::/64)
+            if (b0 == 0x01 && b1 == 0x00 && raw.slice(2..7).all { it == 0.toByte() }) return true
+
+            // RFC 7343 ORCHIDv2 (2001:10::/28 and 2001:20::/28)
+            if (b0 == 0x20 && b1 == 0x01 && raw[2] == 0x00.toByte() && ((raw[3].toInt() and 0xF0) == 0x10 || (raw[3].toInt() and 0xF0) == 0x20)) return true
+
             // Unspecified address (::)
             if (raw.all { it == 0.toByte() }) return true
 
             // Loopback (::1)
             if (raw.take(15).all { it == 0.toByte() } && raw[15] == 1.toByte()) return true
+
+            // IPv4-Compatible IPv6 (::/96, RFC 4291)
+            val isIpv4Compat = raw.take(12).all { it == 0.toByte() } &&
+                    !raw.take(15).all { it == 0.toByte() }
+            if (isIpv4Compat) {
+                val ipv4Bytes = ByteArray(4) { i -> raw[12 + i] }
+                val mappedAddr = try {
+                    InetAddress.getByAddress(ipv4Bytes)
+                } catch (e: Exception) {
+                    return true
+                }
+                return isDisallowedAddress(mappedAddr)
+            }
 
             // NAT64 Well-Known Prefix (64:ff9b::/96)
             val isNat64WellKnown = raw[0] == 0x00.toByte() && raw[1] == 0x64.toByte() &&
@@ -164,6 +201,20 @@ class WasmNetworkEgressSecurityGuard(
             val isIpv4Mapped = raw.take(10).all { it == 0.toByte() } &&
                     raw[10] == 0xFF.toByte() && raw[11] == 0xFF.toByte()
             if (isIpv4Mapped) {
+                val ipv4Bytes = ByteArray(4) { i -> raw[12 + i] }
+                val mappedAddr = try {
+                    InetAddress.getByAddress(ipv4Bytes)
+                } catch (e: Exception) {
+                    return true
+                }
+                return isDisallowedAddress(mappedAddr)
+            }
+
+            // IPv4-Translated IPv6 (::ffff:0:0:0/96, RFC 2765 / RFC 6145 / RFC 6890)
+            val isIpv4Translated = raw.take(8).all { it == 0.toByte() } &&
+                    raw[8] == 0xFF.toByte() && raw[9] == 0xFF.toByte() &&
+                    raw[10] == 0.toByte() && raw[11] == 0.toByte()
+            if (isIpv4Translated) {
                 val ipv4Bytes = ByteArray(4) { i -> raw[12 + i] }
                 val mappedAddr = try {
                     InetAddress.getByAddress(ipv4Bytes)
@@ -201,25 +252,43 @@ class WasmNetworkEgressSecurityGuard(
             return false
         }
 
+        val asciiHost = try {
+            java.net.IDN.toASCII(cleanHost, java.net.IDN.USE_STD3_ASCII_RULES).lowercase()
+        } catch (_: Exception) {
+            return false
+        }
+
         if (cleanPattern.startsWith("*.")) {
-            val suffix = cleanPattern.removePrefix("*.")
+            val rawSuffix = cleanPattern.removePrefix("*.")
+            val suffix = try {
+                java.net.IDN.toASCII(rawSuffix, java.net.IDN.USE_STD3_ASCII_RULES).lowercase()
+            } catch (_: Exception) {
+                return false
+            }
             val parts = suffix.split('.')
             // Must have >= 2 dot-separated parts in suffix (meaning >= 3 labels total with wildcard)
             if (parts.size < 2) {
                 return false
             }
             // Must not target public suffix
-            if (FORBIDDEN_WILDCARD_SUFFIXES.contains(suffix)) {
+            val parsedSuffixUrl = "https://$suffix".toHttpUrlOrNull()
+            if (parsedSuffixUrl?.topPrivateDomain() == null || FORBIDDEN_WILDCARD_SUFFIXES.contains(suffix)) {
                 return false
             }
             // Apex domain must NOT match the wildcard pattern
-            if (cleanHost == suffix) {
+            if (asciiHost == suffix) {
                 return false
             }
-            return cleanHost.endsWith(".$suffix")
+            return asciiHost.endsWith(".$suffix")
         }
 
-        return cleanHost == cleanPattern
+        val asciiPattern = try {
+            java.net.IDN.toASCII(cleanPattern, java.net.IDN.USE_STD3_ASCII_RULES).lowercase()
+        } catch (_: Exception) {
+            return false
+        }
+
+        return asciiHost == asciiPattern
     }
 
     /**
@@ -290,10 +359,11 @@ class WasmNetworkEgressSecurityGuard(
             val key = trimmed.substring(0, colonIdx).trim()
             val value = trimmed.substring(colonIdx + 1).trim()
 
-            // Verify zero embedded control characters in key or value
-            if (key.any { it == '\r' || it == '\n' || it == '\u0000' } ||
-                value.any { it == '\r' || it == '\n' || it == '\u0000' }
-            ) {
+            // Verify zero embedded control characters in key or value (< 0x20 except '\t', or 0x7F)
+            val hasControlChar = { s: String ->
+                s.any { c -> (c.code < 0x20 && c != '\t') || c.code == 0x7F }
+            }
+            if (hasControlChar(key) || hasControlChar(value)) {
                 throw SecurityException("CRLF or control character injection detected in header '$key'")
             }
 
@@ -335,9 +405,9 @@ class WasmNetworkEgressSecurityGuard(
         }
 
         // Step 2: Enforce fail-closed quota check
-        if (maxEgressBytes <= 0) {
+        if (maxEgressBytes <= 0 || maxEgressBytes > WasmNetworkEgressHostModule.MAX_TASK_EGRESS_BYTES) {
             throw SecurityException(
-                "max_egress_bytes must be greater than zero when egress_policy is ALLOWLIST (fail-closed default)"
+                "max_egress_bytes must be between 1 and ${WasmNetworkEgressHostModule.MAX_TASK_EGRESS_BYTES} bytes (fail-closed default)"
             )
         }
 
@@ -393,7 +463,7 @@ class WasmNetworkEgressSecurityGuard(
         }
 
         // Step 6: If host is an IP literal, enforce SSRF guard upfront
-        val isIpLiteral = host.matches(Regex("^(\\d{1,3}\\.){3}\\d{1,3}$")) || host.contains(':')
+        val isIpLiteral = host.matches(IPV4_LITERAL_REGEX) || host.contains(':')
         if (isIpLiteral) {
             val literalAddr = try {
                 InetAddress.getByName(host)

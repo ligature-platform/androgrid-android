@@ -17,6 +17,7 @@ import com.google.protobuf.ByteString
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
@@ -54,6 +55,7 @@ class WasmComputeEngine(
         okHttpClient?.let { return it }
         return lazyOwnedClient ?: synchronized(this) {
             lazyOwnedClient ?: okhttp3.OkHttpClient.Builder()
+                .proxy(java.net.Proxy.NO_PROXY)
                 .dns(dns)
                 .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
                 .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
@@ -70,6 +72,7 @@ class WasmComputeEngine(
             client.dispatcher.executorService.shutdownNow()
             client.connectionPool.evictAll()
         }
+        lazyOwnedClient = null
     }
 
     private class WasmCancelledTrap : RuntimeException("WASM execution cancelled")
@@ -111,14 +114,14 @@ class WasmComputeEngine(
         }
 
         // Step 2b: Enforce Metered Network Guard per [ANTI-003], [INV-003], [NFR-POW-001]
-        if (isMeteredProvider.invoke() && task.egressPolicy == com.androgrid.v1.NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST) {
+        if (isMeteredProvider.invoke() && (task.requiresUnmetered || task.egressPolicy == com.androgrid.v1.NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST)) {
             if (propagateSecurityExceptions) {
-                throw SecurityException("Outbound network access over metered connection is forbidden per [INV-003] and [ANTI-003]")
+                throw SecurityException("Execution over metered connection is forbidden per [INV-003] and [ANTI-003]")
             }
             return TaskExecutionResult.failure(
                 exitCode = -1,
                 errorCode = "METERED_NETWORK_REJECTED",
-                errorMessage = "Outbound network access over metered connection is forbidden per [INV-003] and [ANTI-003]"
+                errorMessage = "Execution over metered connection is forbidden per [INV-003] and [ANTI-003]"
             )
         }
 
@@ -192,6 +195,7 @@ class WasmComputeEngine(
      * @param executionJob active coroutine job used to signal cooperative cancellation.
      * @return TaskExecutionResult with captured stdout, stderr, and exit status.
      */
+    @OptIn(InternalCoroutinesApi::class)
     private fun executeWasmInMemory(
         task: TaskSpec,
         bytecode: ByteString,
@@ -260,7 +264,7 @@ class WasmComputeEngine(
         val cancelled = AtomicBoolean(false)
         val workerThread = AtomicReference<Thread?>(null)
         val interruptLock = Any()
-        val completionHandle = executionJob?.invokeOnCompletion { cause ->
+        val completionHandle = executionJob?.invokeOnCompletion(onCancelling = true) { cause ->
             if (cause != null) {
                 synchronized(interruptLock) {
                     cancelled.set(true)
@@ -356,8 +360,8 @@ class WasmComputeEngine(
                     stderrBytes = stderrBytes
                 )
             } catch (t: Throwable) {
-                if (t is WasmCancelledTrap || t.cause is WasmCancelledTrap || cancelled.get()) {
-                    throw CancellationException("WASM execution cancelled", t)
+                if (t is CancellationException || t.cause is CancellationException || t is WasmCancelledTrap || t.cause is WasmCancelledTrap || cancelled.get()) {
+                    throw (t as? CancellationException) ?: (t.cause as? CancellationException) ?: CancellationException("WASM execution cancelled", t)
                 }
                 val stdoutBytes = stdoutStream.toByteArray()
                 val stderrBytes = stderrStream.toByteArray()

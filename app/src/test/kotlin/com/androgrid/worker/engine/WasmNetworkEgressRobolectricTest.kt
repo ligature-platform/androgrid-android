@@ -292,6 +292,78 @@ class WasmNetworkEgressRobolectricTest {
     }
 
     @Test
+    fun testDistributedHttpBenchmarkWorkload_executesInChicoryWasiSandbox(): Unit = runBlocking {
+        val stream = javaClass.classLoader?.getResourceAsStream("fixtures/http_benchmark.wasm")
+        val wasmBytes = if (stream != null) {
+            stream.readBytes()
+        } else {
+            val candidates = listOf(
+                java.io.File("../androgrid-backend/workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm"),
+                java.io.File("../../androgrid-backend/workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm"),
+                java.io.File("../androgrid-backend/tests/fixtures/wasm/http_benchmark.wasm"),
+                java.io.File("../../androgrid-backend/tests/fixtures/wasm/http_benchmark.wasm"),
+                java.io.File("src/test/resources/fixtures/http_benchmark.wasm"),
+                java.io.File("app/src/test/resources/fixtures/http_benchmark.wasm")
+            )
+            val wasmFile = checkNotNull(candidates.firstOrNull { it.exists() }) {
+                "Fixture missing: http_benchmark.wasm could not be located in candidates: $candidates"
+            }
+            wasmFile.readBytes()
+        }
+
+        mockServer.start()
+        val port = mockServer.port
+        for (i in 1..5) {
+            mockServer.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setHeader("Content-Type", "application/json")
+                    .setBody("""{"status":"ok","iteration":$i}""")
+            )
+        }
+
+        val targetUrl = "http://api.edge-compute.org:$port/benchmark"
+        val mockDns = object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> {
+                return if (hostname == "api.edge-compute.org") {
+                    listOf(InetAddress.getByName("127.0.0.1"))
+                } else {
+                    listOf(InetAddress.getByName("93.184.216.34"))
+                }
+            }
+        }
+
+        val engine = WasmComputeEngine(
+            dns = mockDns,
+            isMeteredProvider = { false },
+            allowLoopbackForTesting = true
+        )
+
+        val task = TaskSpec.newBuilder()
+            .setTaskId("task_http_bench_001")
+            .setEngine(ExecutionEngine.EXECUTION_ENGINE_WASM_WASI)
+            .setEgressPolicy(NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST)
+            .addAllowedHostnames("api.edge-compute.org")
+            .setMaxEgressBytes(2097152)
+            .setTimeoutSeconds(15)
+            .putEnvVars("TARGET_URL", targetUrl)
+            .putEnvVars("METHOD", "GET")
+            .putEnvVars("DURATION_SECS", "5")
+            .putEnvVars("MAX_REQUESTS", "3")
+            .setWasmBytecode(ByteString.copyFrom(wasmBytes))
+            .build()
+
+        val result = engine.execute(task)
+
+        assertThat(result.isSuccess).isTrue()
+        assertThat(result.exitCode).isEqualTo(0)
+        val stdout = String(result.stdoutBytes, Charsets.UTF_8)
+        assertThat(stdout).contains("AndroGrid Distributed HTTP Benchmark")
+        assertThat(stdout).contains("JSON Report:")
+        assertThat(stdout).contains(""""total_requests": 3""")
+    }
+
+    @Test
     fun testDeterministicRejection_toctouDnsRebindingAtConnectionTime() {
         val guard = WasmNetworkEgressSecurityGuard(allowLoopbackForTesting = false)
 
@@ -389,6 +461,13 @@ class WasmNetworkEgressRobolectricTest {
         assertThat(guard.isDisallowedAddress(nat64LocalUse)).isTrue()
         assertThat(guard.isDisallowedAddress(sixToFour)).isTrue()
         assertThat(guard.isDisallowedAddress(teredo)).isTrue()
+
+        // RFC 6890 / 5736 / 5737 and IPv4-compatible IPv6
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("192.0.0.1"))).isTrue()
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("192.0.2.1"))).isTrue()
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("198.51.100.1"))).isTrue()
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("203.0.113.1"))).isTrue()
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("::192.168.1.1"))).isTrue()
     }
 
     @Test
@@ -401,6 +480,9 @@ class WasmNetworkEgressRobolectricTest {
 
         // Wildcard must NOT match apex domain
         assertThat(guard.matchesHostnamePattern("example.com", "*.example.com")).isFalse()
+
+        // Public suffix wildcards forbidden via topPrivateDomain()
+        assertThat(guard.matchesHostnamePattern("co.uk", "*.co.uk")).isFalse()
 
         // Wildcard matches subdomains
         assertThat(guard.matchesHostnamePattern("api.example.com", "*.example.com")).isTrue()
@@ -423,7 +505,18 @@ class WasmNetworkEgressRobolectricTest {
                 maxEgressBytes = 0
             )
         }
-        assertThat(exZeroQuota.message).contains("max_egress_bytes must be greater than zero")
+        assertThat(exZeroQuota.message).contains("max_egress_bytes must be between 1 and")
+
+        // max_egress_bytes > 64 MB must be rejected
+        val exOverQuota = assertThrows(SecurityException::class.java) {
+            guard.validateOutboundUrl(
+                urlString = "https://api.example.com/data",
+                policy = NetworkEgressPolicy.NETWORK_EGRESS_POLICY_ALLOWLIST,
+                allowedHostnames = listOf("api.example.com"),
+                maxEgressBytes = 65L * 1024 * 1024
+            )
+        }
+        assertThat(exOverQuota.message).contains("max_egress_bytes must be between 1 and")
 
         // Metered provider true must be rejected
         val exMetered = assertThrows(SecurityException::class.java) {
@@ -662,6 +755,70 @@ class WasmNetworkEgressRobolectricTest {
         assertThat(guard.matchesHostnamePattern("evil.co.uk", "*.co.uk")).isFalse()
         assertThat(guard.matchesHostnamePattern("evil.workers.dev", "*.workers.dev")).isFalse()
         assertThat(guard.matchesHostnamePattern("evil.amazonaws.com", "*.amazonaws.com")).isFalse()
+        assertThat(guard.matchesHostnamePattern("sub.co.il", "*.co.il")).isFalse()
+        assertThat(guard.matchesHostnamePattern("my-app.run.app", "*.run.app")).isFalse()
+    }
+
+    @Test
+    fun testIpv4MappedLoopbackExplicitRawBytes() {
+        val guard = WasmNetworkEgressSecurityGuard(allowLoopbackForTesting = false)
+
+        // ::ffff:127.0.0.1 constructed via raw 16 bytes
+        val raw16Bytes = ByteArray(16)
+        raw16Bytes[10] = 0xFF.toByte()
+        raw16Bytes[11] = 0xFF.toByte()
+        raw16Bytes[12] = 127.toByte()
+        raw16Bytes[13] = 0.toByte()
+        raw16Bytes[14] = 0.toByte()
+        raw16Bytes[15] = 1.toByte()
+
+        val rawAddr = java.net.Inet6Address.getByAddress(null, raw16Bytes, -1)
+        assertThat(guard.isDisallowedAddress(rawAddr)).isTrue()
+    }
+
+    @Test
+    fun testRfc6890DisallowedRanges() {
+        val guard = WasmNetworkEgressSecurityGuard(allowLoopbackForTesting = false)
+
+        // 192.88.99.1 (6to4 relay)
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("192.88.99.1"))).isTrue()
+
+        // 2001:db8::1 (Documentation)
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("2001:db8::1"))).isTrue()
+
+        // 100::1 (Discard)
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("100::1"))).isTrue()
+
+        // 2001:10::1 and 2001:20::1 (ORCHIDv2)
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("2001:10::1"))).isTrue()
+        assertThat(guard.isDisallowedAddress(InetAddress.getByName("2001:20::1"))).isTrue()
+
+        // IPv4-translated ::ffff:0:127.0.0.1
+        val translatedBytes = ByteArray(16)
+        translatedBytes[8] = 0xFF.toByte()
+        translatedBytes[9] = 0xFF.toByte()
+        translatedBytes[12] = 127.toByte()
+        translatedBytes[15] = 1.toByte()
+        val translatedAddr = java.net.Inet6Address.getByAddress(null, translatedBytes, -1)
+        assertThat(guard.isDisallowedAddress(translatedAddr)).isTrue()
+    }
+
+    @Test
+    fun testTaskRequiresUnmeteredFailsOnMeteredNetwork() = runBlocking {
+        val engine = WasmComputeEngine(
+            isMeteredProvider = { true }
+        )
+
+        val task = TaskSpec.newBuilder()
+            .setTaskId("task_metered_check")
+            .setEngine(ExecutionEngine.EXECUTION_ENGINE_WASM_WASI)
+            .setRequiresUnmetered(true)
+            .setWasmBytecode(ByteString.copyFrom(ByteArray(8)))
+            .build()
+
+        val result = engine.execute(task)
+        assertThat(result.exitCode).isEqualTo(-1)
+        assertThat(result.errorCode).isEqualTo("METERED_NETWORK_REJECTED")
     }
 
     private fun delayMs(ms: Long) {
