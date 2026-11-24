@@ -28,6 +28,13 @@ data class DiscoveredCluster(
 ) {
     /**
      * Canonical cluster endpoint string in host:port format.
+     * Encloses IPv6 address literals in RFC 3986 brackets.
      */
-    fun endpoint(): String = "$host:$port"
+    fun endpoint(): String {
+        return if (host.contains(':') && !host.startsWith("[")) {
+            "[$host]:$port"
+        } else {
+            "$host:$port"
+        }
+    }
 }

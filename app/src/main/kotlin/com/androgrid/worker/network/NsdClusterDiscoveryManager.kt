@@ -9,6 +9,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.util.ArrayDeque
 
 /**
@@ -31,6 +34,7 @@ class NsdClusterDiscoveryManager(
         private const val TAG = "NsdClusterDiscovery"
         const val SERVICE_TYPE = "_androgrid._tcp"
         private const val MULTICAST_LOCK_TAG = "AndroGridClusterDiscovery"
+        private const val MAX_RESOLVE_QUEUE_SIZE = 16
     }
 
     private val multicastLock: WifiManager.MulticastLock? by lazy {
@@ -45,8 +49,11 @@ class NsdClusterDiscoveryManager(
     private val _isDiscovering = MutableStateFlow(false)
     override val isDiscovering: StateFlow<Boolean> = _isDiscovering.asStateFlow()
 
+    private val stateLock = Any()
+    private var currentSessionId: Long = 0L
+    private var isResolving: Boolean = false
     private val resolveQueue = ArrayDeque<NsdServiceInfo>()
-    private var isResolving = false
+    private val pendingServiceNames = HashSet<String>()
 
     private val discoveryListener = object : NsdManager.DiscoveryListener {
         override fun onDiscoveryStarted(regType: String) {
@@ -58,13 +65,17 @@ class NsdClusterDiscoveryManager(
             Log.d(TAG, "Service found: ${serviceInfo.serviceName} (${serviceInfo.serviceType})")
             val type = serviceInfo.serviceType ?: ""
             if (type.contains("_androgrid._tcp", ignoreCase = true)) {
-                enqueueResolve(serviceInfo)
+                val session = synchronized(stateLock) { currentSessionId }
+                enqueueResolve(serviceInfo, session)
             }
         }
 
         override fun onServiceLost(serviceInfo: NsdServiceInfo) {
             Log.d(TAG, "Service lost: ${serviceInfo.serviceName}")
             val name = serviceInfo.serviceName ?: return
+            synchronized(stateLock) {
+                pendingServiceNames.remove(name)
+            }
             _discoveredClusters.update { list ->
                 list.filterNot { it.serviceName == name }
             }
@@ -90,9 +101,14 @@ class NsdClusterDiscoveryManager(
     }
 
     override fun startDiscovery() {
-        if (_isDiscovering.value) {
-            Log.d(TAG, "mDNS discovery already active; ignoring start request")
-            return
+        val sessionId: Long
+        synchronized(stateLock) {
+            if (_isDiscovering.value) {
+                Log.d(TAG, "mDNS discovery already active; ignoring start request")
+                return
+            }
+            currentSessionId++
+            sessionId = currentSessionId
         }
 
         acquireMulticastLock()
@@ -106,17 +122,26 @@ class NsdClusterDiscoveryManager(
 
         try {
             nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
-            _isDiscovering.value = true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initiate mDNS service discovery: ${e.message}", e)
-            _isDiscovering.value = false
+            synchronized(stateLock) {
+                if (currentSessionId == sessionId) {
+                    _isDiscovering.value = false
+                }
+            }
             releaseMulticastLock()
         }
     }
 
     override fun stopDiscovery() {
-        if (!_isDiscovering.value) {
-            return
+        synchronized(stateLock) {
+            if (!_isDiscovering.value) {
+                return
+            }
+            currentSessionId++
+            resolveQueue.clear()
+            pendingServiceNames.clear()
+            isResolving = false
         }
 
         try {
@@ -126,10 +151,6 @@ class NsdClusterDiscoveryManager(
         } finally {
             _isDiscovering.value = false
             releaseMulticastLock()
-            synchronized(resolveQueue) {
-                resolveQueue.clear()
-                isResolving = false
-            }
             _discoveredClusters.value = emptyList()
         }
     }
@@ -160,58 +181,110 @@ class NsdClusterDiscoveryManager(
         }
     }
 
-    private fun enqueueResolve(serviceInfo: NsdServiceInfo) {
-        synchronized(resolveQueue) {
-            resolveQueue.add(serviceInfo)
-            if (!isResolving) {
-                resolveNext()
+    private fun enqueueResolve(serviceInfo: NsdServiceInfo, sessionId: Long) {
+        val toResolve: NsdServiceInfo? = synchronized(stateLock) {
+            if (sessionId != currentSessionId || !_isDiscovering.value) return
+            val name = serviceInfo.serviceName ?: return
+            if (pendingServiceNames.size >= MAX_RESOLVE_QUEUE_SIZE || !pendingServiceNames.add(name)) {
+                return
             }
+            resolveQueue.addLast(serviceInfo)
+            if (!isResolving) {
+                isResolving = true
+                resolveQueue.removeFirst()
+            } else {
+                null
+            }
+        }
+
+        if (toResolve != null) {
+            invokeResolveOutsideLock(toResolve, sessionId)
         }
     }
 
-    private fun resolveNext() {
-        val nextService: NsdServiceInfo
-        synchronized(resolveQueue) {
-            if (resolveQueue.isEmpty()) {
-                isResolving = false
-                return
-            }
-            isResolving = true
-            nextService = resolveQueue.removeFirst()
-        }
-
+    private fun invokeResolveOutsideLock(serviceInfo: NsdServiceInfo, sessionId: Long) {
         val nsd = nsdManager
         if (nsd == null) {
-            synchronized(resolveQueue) { isResolving = false }
+            completeResolve(serviceInfo, sessionId)
             return
         }
 
         try {
-            nsd.resolveService(nextService, object : NsdManager.ResolveListener {
+            nsd.resolveService(serviceInfo, object : NsdManager.ResolveListener {
                 override fun onServiceResolved(resolvedService: NsdServiceInfo) {
-                    handleServiceResolved(resolvedService)
-                    synchronized(resolveQueue) { resolveNext() }
+                    handleServiceResolved(resolvedService, sessionId)
+                    completeResolve(serviceInfo, sessionId)
                 }
 
-                override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                    Log.w(TAG, "Resolve failed for ${serviceInfo.serviceName}: errorCode=$errorCode")
-                    synchronized(resolveQueue) { resolveNext() }
+                override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
+                    Log.w(TAG, "Resolve failed for ${info.serviceName}: errorCode=$errorCode")
+                    completeResolve(serviceInfo, sessionId)
                 }
             })
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to invoke resolveService for ${nextService.serviceName}: ${e.message}")
-            synchronized(resolveQueue) { resolveNext() }
+            Log.w(TAG, "Failed to invoke resolveService for ${serviceInfo.serviceName}: ${e.message}")
+            completeResolve(serviceInfo, sessionId)
         }
     }
 
-    private fun handleServiceResolved(info: NsdServiceInfo) {
+    private fun completeResolve(serviceInfo: NsdServiceInfo, sessionId: Long) {
+        val nextService: NsdServiceInfo? = synchronized(stateLock) {
+            serviceInfo.serviceName?.let { pendingServiceNames.remove(it) }
+            if (sessionId != currentSessionId || !_isDiscovering.value || resolveQueue.isEmpty()) {
+                isResolving = false
+                null
+            } else {
+                resolveQueue.removeFirst()
+            }
+        }
+
+        if (nextService != null) {
+            invokeResolveOutsideLock(nextService, sessionId)
+        }
+    }
+
+    private fun isValidLanHost(addr: InetAddress): Boolean {
+        if (addr.isAnyLocalAddress || addr.isLoopbackAddress || addr.isMulticastAddress) return false
+        if (addr is Inet4Address) {
+            return addr.isSiteLocalAddress // 10/8, 172.16/12, 192.168/16
+        }
+        if (addr is Inet6Address) {
+            // Reject unroutable link-local without scope
+            if (addr.isLinkLocalAddress) return false
+            // Allow RFC 4193 ULA fc00::/7
+            val firstByte = addr.address[0].toInt() and 0xFF
+            return (firstByte and 0xFE) == 0xFC
+        }
+        return false
+    }
+
+    private fun handleServiceResolved(info: NsdServiceInfo, sessionId: Long) {
+        synchronized(stateLock) {
+            if (sessionId != currentSessionId || !_isDiscovering.value) {
+                Log.d(TAG, "Ignoring stale resolve callback for session $sessionId (active: $currentSessionId)")
+                return
+            }
+        }
+
         val hostAddress = info.host?.hostAddress
-        if (hostAddress.isNullOrBlank()) {
+        val hostInet = info.host
+        if (hostAddress.isNullOrBlank() || hostInet == null) {
             Log.w(TAG, "Resolved service without valid host IP: ${info.serviceName}")
             return
         }
 
-        // Strip IPv6 scope identifiers if present
+        if (!isValidLanHost(hostInet)) {
+            Log.w(TAG, "Rejected non-private or loopback host IP: $hostAddress for ${info.serviceName}")
+            return
+        }
+
+        val port = info.port
+        if (port !in 1..65535) {
+            Log.w(TAG, "Rejected out-of-range port: $port for ${info.serviceName}")
+            return
+        }
+
+        // Clean IPv6 host address
         val cleanHost = if (hostAddress.contains("%")) {
             hostAddress.substringBefore("%")
         } else {
@@ -219,13 +292,12 @@ class NsdClusterDiscoveryManager(
         }
 
         val serviceName = info.serviceName ?: "androgrid-orchestrator"
-        val port = info.port
-
         val attributes = info.attributes ?: emptyMap()
         val clusterName = attributes["name"]?.let { String(it, Charsets.UTF_8) }?.takeIf { it.isNotBlank() } ?: serviceName
         val version = attributes["version"]?.let { String(it, Charsets.UTF_8) } ?: ""
         val tlsVersion = attributes["tls"]?.let { String(it, Charsets.UTF_8) } ?: "1.3"
-        val caFingerprint = attributes["ca_fingerprint"]?.let { String(it, Charsets.UTF_8) } ?: ""
+        val rawFingerprint = attributes["ca_fingerprint"]?.let { String(it, Charsets.UTF_8) }?.trim()?.lowercase() ?: ""
+        val caFingerprint = if (rawFingerprint.matches(Regex("^[0-9a-f]{64}$"))) rawFingerprint else ""
         val nodeCount = attributes["nodes"]?.let { String(it, Charsets.UTF_8).toIntOrNull() } ?: 0
 
         val cluster = DiscoveredCluster(

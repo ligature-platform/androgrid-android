@@ -18,7 +18,7 @@ import java.net.InetAddress
 
 /**
  * Unit tests for [NsdClusterDiscoveryManager] verifying mDNS service discovery,
- * resolution queueing, multicast lock lifecycle, and error resilience.
+ * resolution queueing, multicast lock lifecycle, session fencing, and input validation.
  *
  * Traces to: [REQ-OP-001], [INV-001], [INV-002], [NFR-POW-001]
  */
@@ -61,6 +61,7 @@ class ClusterDiscoveryManagerTest {
                 capture(discoveryListenerSlot)
             )
         }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
         assertThat(manager.isDiscovering.value).isTrue()
     }
 
@@ -74,6 +75,7 @@ class ClusterDiscoveryManagerTest {
 
         manager.startDiscovery()
         verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
 
         every { mockMulticastLock.isHeld } returns true
 
@@ -95,6 +97,7 @@ class ClusterDiscoveryManagerTest {
 
         manager.startDiscovery()
         verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
 
         val serviceInfo = NsdServiceInfo().apply {
             serviceName = "androgrid-orchestrator"
@@ -116,6 +119,7 @@ class ClusterDiscoveryManagerTest {
 
         manager.startDiscovery()
         verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
 
         val rawService = NsdServiceInfo().apply {
             serviceName = "androgrid-orchestrator"
@@ -162,6 +166,7 @@ class ClusterDiscoveryManagerTest {
 
         manager.startDiscovery()
         verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
 
         val resolvedService = NsdServiceInfo().apply {
             serviceName = "cluster-a"
@@ -194,6 +199,7 @@ class ClusterDiscoveryManagerTest {
 
         manager.startDiscovery()
         verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
 
         every { mockMulticastLock.isHeld } returns true
 
@@ -204,6 +210,10 @@ class ClusterDiscoveryManagerTest {
         discoveryListenerSlot.captured.onStopDiscoveryFailed("_androgrid._tcp", NsdManager.FAILURE_INTERNAL_ERROR)
         assertThat(manager.isDiscovering.value).isFalse()
 
+        // Re-start discovery to test resolve failure handling during active session
+        manager.startDiscovery()
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
+
         val service = NsdServiceInfo().apply {
             serviceName = "faulty"
             serviceType = "_androgrid._tcp"
@@ -213,5 +223,142 @@ class ClusterDiscoveryManagerTest {
         resolveListenerSlot.captured.onResolveFailed(service, NsdManager.FAILURE_INTERNAL_ERROR)
 
         assertThat(manager.discoveredClusters.value).isEmpty()
+    }
+
+    @Test
+    fun testLateResolveCallbackAfterStopDiscovery_isIgnoredBySessionFencing() {
+        val manager = NsdClusterDiscoveryManager(
+            context = ApplicationProvider.getApplicationContext(),
+            nsdManager = mockNsdManager,
+            wifiManager = mockWifiManager
+        )
+
+        manager.startDiscovery()
+        verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
+
+        val service = NsdServiceInfo().apply {
+            serviceName = "slow-cluster"
+            serviceType = "_androgrid._tcp"
+        }
+        discoveryListenerSlot.captured.onServiceFound(service)
+        verify { mockNsdManager.resolveService(service, capture(resolveListenerSlot)) }
+
+        // Stop discovery before the async resolve callback completes
+        manager.stopDiscovery()
+        assertThat(manager.discoveredClusters.value).isEmpty()
+
+        // Late callback arrives after discovery was stopped
+        val resolvedService = NsdServiceInfo().apply {
+            serviceName = "slow-cluster"
+            serviceType = "_androgrid._tcp"
+            host = InetAddress.getByName("192.168.1.100")
+            port = 50051
+        }
+        resolveListenerSlot.captured.onServiceResolved(resolvedService)
+
+        // Session fencing must prevent resurrecting the cluster
+        assertThat(manager.discoveredClusters.value).isEmpty()
+    }
+
+    @Test
+    fun testHostValidation_rejectsLoopbackMulticastAndPublicIps() {
+        val manager = NsdClusterDiscoveryManager(
+            context = ApplicationProvider.getApplicationContext(),
+            nsdManager = mockNsdManager,
+            wifiManager = mockWifiManager
+        )
+
+        manager.startDiscovery()
+        verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
+
+        val testCases = listOf(
+            "127.0.0.1",       // Loopback
+            "8.8.8.8",         // Public IP
+            "224.0.0.1",       // Multicast
+            "0.0.0.0"          // Unspecified
+        )
+
+        for ((idx, ip) in testCases.withIndex()) {
+            val service = NsdServiceInfo().apply {
+                serviceName = "rogue-$idx"
+                serviceType = "_androgrid._tcp"
+                host = InetAddress.getByName(ip)
+                port = 50051
+            }
+            discoveryListenerSlot.captured.onServiceFound(service)
+            verify { mockNsdManager.resolveService(service, capture(resolveListenerSlot)) }
+            resolveListenerSlot.captured.onServiceResolved(service)
+        }
+
+        // None of the non-private IPs should be accepted
+        assertThat(manager.discoveredClusters.value).isEmpty()
+    }
+
+    @Test
+    fun testPortValidation_rejectsZeroAndOutOfRangePorts() {
+        val manager = NsdClusterDiscoveryManager(
+            context = ApplicationProvider.getApplicationContext(),
+            nsdManager = mockNsdManager,
+            wifiManager = mockWifiManager
+        )
+
+        manager.startDiscovery()
+        verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
+
+        val invalidPorts = listOf(0, -1, 70000)
+        for ((idx, port) in invalidPorts.withIndex()) {
+            val service = NsdServiceInfo().apply {
+                serviceName = "bad-port-$idx"
+                serviceType = "_androgrid._tcp"
+                host = InetAddress.getByName("192.168.1.50")
+                this.port = port
+            }
+            discoveryListenerSlot.captured.onServiceFound(service)
+            verify { mockNsdManager.resolveService(service, capture(resolveListenerSlot)) }
+            resolveListenerSlot.captured.onServiceResolved(service)
+        }
+
+        assertThat(manager.discoveredClusters.value).isEmpty()
+    }
+
+    @Test
+    fun testIpv6Endpoint_bracketsLiterals() {
+        val cluster = DiscoveredCluster(
+            serviceName = "ipv6-cluster",
+            host = "fd00::1",
+            port = 50051
+        )
+        assertThat(cluster.endpoint()).isEqualTo("[fd00::1]:50051")
+    }
+
+    @Test
+    fun testMalformedCaFingerprint_sanitizedToEmpty() {
+        val manager = NsdClusterDiscoveryManager(
+            context = ApplicationProvider.getApplicationContext(),
+            nsdManager = mockNsdManager,
+            wifiManager = mockWifiManager
+        )
+
+        manager.startDiscovery()
+        verify { mockNsdManager.discoverServices(any(), any(), capture(discoveryListenerSlot)) }
+        discoveryListenerSlot.captured.onDiscoveryStarted(NsdClusterDiscoveryManager.SERVICE_TYPE)
+
+        val service = NsdServiceInfo().apply {
+            serviceName = "bad-fingerprint"
+            serviceType = "_androgrid._tcp"
+            host = InetAddress.getByName("192.168.1.100")
+            port = 50051
+            setAttribute("ca_fingerprint", "not-a-valid-64-hex-sha256")
+        }
+        discoveryListenerSlot.captured.onServiceFound(service)
+        verify { mockNsdManager.resolveService(service, capture(resolveListenerSlot)) }
+        resolveListenerSlot.captured.onServiceResolved(service)
+
+        val clusters = manager.discoveredClusters.value
+        assertThat(clusters).hasSize(1)
+        assertThat(clusters[0].caFingerprint).isEmpty()
     }
 }
