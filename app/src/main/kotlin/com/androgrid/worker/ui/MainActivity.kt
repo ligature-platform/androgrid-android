@@ -469,15 +469,6 @@ class MainActivity : ComponentActivity() {
     }
 
     internal fun handleConnectAndPair(cluster: DiscoveredCluster, pairingToken: String? = null) {
-        val repo = settingsRepository ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
-
-        if (repo.getSettings().hasMtlsCredentials) {
-            repo.updateWifiEndpoint(cluster.host, cluster.port)
-            Toast.makeText(this, "Connected to ${cluster.clusterName}! Starting compute participation...", Toast.LENGTH_SHORT).show()
-            viewModel.startParticipation()
-            return
-        }
-
         if (!pairingToken.isNullOrBlank()) {
             executeEnrollmentWithToken(cluster, pairingToken)
             return
@@ -487,6 +478,24 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun promptPairingDialog(cluster: DiscoveredCluster) {
+        if (cluster.caFingerprint.isBlank()) {
+            AlertDialog.Builder(this)
+                .setTitle("AndroGrid Cluster Detected")
+                .setMessage(
+                    "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})\n\n" +
+                    "Warning: This cluster advertises no CA fingerprint.\n\n" +
+                    "Zero-config pairing is blocked to prevent MITM interception. Please use QR scan or configure credentials manually."
+                )
+                .setNeutralButton("Scan QR") { _, _ ->
+                    val intent = Intent(this@MainActivity, QrScannerActivity::class.java)
+                    qrScanLauncher.launch(intent)
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+            return
+        }
+
+        val formattedFp = cluster.caFingerprint.chunked(4).joinToString(" ").uppercase()
         val input = EditText(this).apply {
             hint = "Pairing Token"
             inputType = InputType.TYPE_CLASS_TEXT
@@ -496,17 +505,12 @@ class MainActivity : ComponentActivity() {
             setPadding(24, 20, 24, 20)
         }
 
-        val fingerprintDisplay = if (cluster.caFingerprint.isNotBlank()) {
-            "CA Fingerprint: ${cluster.caFingerprint}"
-        } else {
-            "CA Fingerprint: Not advertised (enrollment blocked)"
-        }
-
         AlertDialog.Builder(this)
             .setTitle("AndroGrid Cluster Detected")
             .setMessage(
-                "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})\n" +
-                "$fingerprintDisplay\n\n" +
+                "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})\n\n" +
+                "Verify CA Fingerprint against orchestrator terminal:\n" +
+                "$formattedFp\n\n" +
                 "Enter pairing token from orchestrator dashboard or scan QR code:"
             )
             .setView(input)
@@ -545,8 +549,6 @@ class MainActivity : ComponentActivity() {
                 val result = coordinator.executeEnrollment(payload, viewModel.uiState.value.nodeId)
                 when (result) {
                     is EnrollmentResult.Success -> {
-                        // Persist Wi-Fi endpoint atomically upon verified enrollment
-                        repo.updateWifiEndpoint(cluster.host, cluster.port)
                         Toast.makeText(this@MainActivity, "Device enrolled in cluster! Starting compute participation...", Toast.LENGTH_LONG).show()
                         viewModel.startParticipation()
                     }

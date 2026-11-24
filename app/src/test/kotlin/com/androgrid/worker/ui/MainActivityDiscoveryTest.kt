@@ -157,10 +157,7 @@ class MainActivityDiscoveryTest {
     }
 
     @Test
-    fun testConnectAndPair_whenAlreadyEnrolled_startsComputeParticipationDirectly() {
-        repo.updateCertificates("CA_CERT", "CLIENT_CERT", "CLIENT_KEY")
-        assertThat(repo.getSettings().hasMtlsCredentials).isTrue()
-
+    fun testPromptPairingDialog_whenFingerprintBlank_omitsPairButtonAndShowsWarning() {
         val controller = Robolectric.buildActivity(MainActivity::class.java)
         val activity = controller.get()
         activity.settingsRepository = repo
@@ -169,18 +166,52 @@ class MainActivityDiscoveryTest {
         Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
 
         val cluster = DiscoveredCluster(
-            serviceName = "androgrid-orchestrator",
-            host = "192.168.1.88",
+            serviceName = "unsecured-cluster",
+            host = "192.168.1.55",
             port = 50051,
-            clusterName = "office-lab"
+            clusterName = "unsecured",
+            caFingerprint = ""
         )
 
         activity.handleConnectAndPair(cluster)
         Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
 
-        assertThat(repo.getSettings().wifiHost).isEqualTo("192.168.1.88")
-        assertThat(repo.getSettings().wifiPort).isEqualTo(50051)
-        assertThat(activity.getDashboardViewModel().uiState.value.isComputeActive).isTrue()
+        val dialog = org.robolectric.shadows.ShadowAlertDialog.getLatestAlertDialog()
+        assertThat(dialog).isNotNull()
+        val shadowDialog = Shadows.shadowOf(dialog)
+        assertThat(shadowDialog.message.toString()).contains("Warning: This cluster advertises no CA fingerprint")
+        assertThat(dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).visibility).isEqualTo(View.GONE)
+
+        controller.destroy()
+    }
+
+    @Test
+    fun testPromptPairingDialog_whenFingerprintPresent_formatsChunksAndEnablesPairButton() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java)
+        val activity = controller.get()
+        activity.settingsRepository = repo
+
+        controller.create().start().resume()
+        Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        val rawFingerprint = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        val cluster = DiscoveredCluster(
+            serviceName = "secured-cluster",
+            host = "192.168.1.66",
+            port = 50051,
+            clusterName = "secured",
+            caFingerprint = rawFingerprint
+        )
+
+        activity.handleConnectAndPair(cluster)
+        Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        val dialog = org.robolectric.shadows.ShadowAlertDialog.getLatestAlertDialog()
+        assertThat(dialog).isNotNull()
+        val shadowDialog = Shadows.shadowOf(dialog)
+        assertThat(shadowDialog.message.toString()).contains("Verify CA Fingerprint against orchestrator terminal")
+        assertThat(shadowDialog.message.toString()).contains("ABCD EF12")
+        assertThat(dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).visibility).isEqualTo(View.VISIBLE)
 
         controller.destroy()
     }
