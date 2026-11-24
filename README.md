@@ -36,6 +36,28 @@ The distributed mobile edge compute worker for **AndroGrid**: executing isolated
 
 ---
 
+## Quick Download & Install (Alpha Testers)
+
+Direct APK package distribution for Android 12+ (API 31+) ARM64 devices:
+
+<p align="center">
+  <a href="https://github.com/ligature-platform/androgrid-android/releases/latest/download/androgrid-worker.apk">
+    <img src="docs/assets/download-qr.png" alt="Scan to Download AndroGrid Worker APK" width="180" height="180" />
+  </a>
+  <br />
+  <a href="https://github.com/ligature-platform/androgrid-android/releases/latest/download/androgrid-worker.apk">
+    <strong>Download androgrid-worker.apk (Direct Release Asset)</strong>
+  </a>
+</p>
+
+1. **Download:** Scan the QR code with your mobile device or tap the direct APK link.
+2. **Sideload:** Tap the downloaded APK and toggle "Allow from this source" when prompted.
+3. **Automated OTA:** Subsequent releases self-update seamlessly over the cluster control plane via the integrated `UpgradeManager`.
+
+For detailed onboarding, pairing walkthroughs, and OEM battery configurations, see the [Worker Onboarding Guide](docs/worker-guide.md).
+
+---
+
 ## Getting Started
 
 ### Prerequisites

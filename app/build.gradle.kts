@@ -60,6 +60,9 @@ android {
                 "proguard-rules.pro"
             )
             signingConfig = signingConfigs.getByName("release")
+            ndk {
+                abiFilters += listOf("arm64-v8a")
+            }
         }
     }
 
