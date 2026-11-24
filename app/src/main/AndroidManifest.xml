@@ -6,6 +6,11 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- Wi-Fi Multicast lock and status permissions for mDNS / NSD local cluster discovery -->
+    <!-- Traces to: [REQ-OP-001], [INV-001] -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
     <!-- Android 14 Typed Foreground Service permissions -->
     <!-- Traces to: [REQ-VER-001] -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

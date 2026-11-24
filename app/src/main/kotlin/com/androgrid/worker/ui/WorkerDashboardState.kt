@@ -24,7 +24,8 @@ data class WorkerDashboardState(
     val tasksCompletedCount: Int = 0,
     val tasksFailedCount: Int = 0,
     val recentEntries: List<TaskLedgerEntry> = emptyList(),
-    val statusBannerText: String = "Offline: Execution Paused"
+    val statusBannerText: String = "Offline: Execution Paused",
+    val discoveredClusters: List<com.androgrid.worker.network.DiscoveredCluster> = emptyList()
 ) {
     /**
      * Formats RAM in Gigabytes with 1 decimal place.

@@ -384,4 +384,74 @@ class WorkerDashboardViewModelTest {
         assertThat(vm1.uiState.value.isComputeActive).isFalse()
         assertThat(vm2.uiState.value.isComputeActive).isFalse()
     }
+
+    private class FakeClusterDiscoveryManager : com.androgrid.worker.network.ClusterDiscoveryManager {
+        val startCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val stopCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val clustersFlow = MutableStateFlow<List<com.androgrid.worker.network.DiscoveredCluster>>(emptyList())
+        val discoveringFlow = MutableStateFlow(false)
+
+        override val discoveredClusters: StateFlow<List<com.androgrid.worker.network.DiscoveredCluster>> = clustersFlow
+        override val isDiscovering: StateFlow<Boolean> = discoveringFlow
+
+        override fun startDiscovery() {
+            startCalls.incrementAndGet()
+            discoveringFlow.value = true
+        }
+
+        override fun stopDiscovery() {
+            stopCalls.incrementAndGet()
+            discoveringFlow.value = false
+            clustersFlow.value = emptyList()
+        }
+    }
+
+    @Test
+    fun testClusterDiscoveryIntegration_startsOnWifiAndHaltsOnCellularOrOffline() = runTest {
+        val routeFlow = MutableStateFlow<NetworkRoute>(NetworkRoute.Offline)
+        val fakeDiscovery = FakeClusterDiscoveryManager()
+        val coordinator = WorkerLifecycleCoordinator(routeFlow, RecordingServiceController(), RecordingWorkScheduler())
+
+        val viewModel = WorkerDashboardViewModel(
+            nodeId = "node_discovery_test",
+            routeFlow = routeFlow,
+            capabilityProvider = DeviceCapabilityProvider(FakeRootChecker(), FakeSystemInfo()),
+            batteryProvider = FakeBatteryProvider(),
+            coordinator = coordinator,
+            discoveryManager = fakeDiscovery
+        )
+        testScheduler.advanceUntilIdle()
+
+        // Initially offline: discovery not started, stop was invoked on offline state
+        assertThat(fakeDiscovery.startCalls.get()).isEqualTo(0)
+        assertThat(fakeDiscovery.stopCalls.get()).isEqualTo(1)
+
+        // Route transitions to Wi-Fi LAN: discovery automatically activated
+        routeFlow.value = NetworkRoute.LanConnected(isMetered = false)
+        testScheduler.advanceUntilIdle()
+        assertThat(fakeDiscovery.startCalls.get()).isEqualTo(1)
+
+        // Simulate discovery of a cluster
+        val cluster = com.androgrid.worker.network.DiscoveredCluster(
+            serviceName = "orchestrator-1",
+            host = "192.168.1.50",
+            port = 50051,
+            clusterName = "lab-cluster",
+            version = "0.0.1",
+            caFingerprint = "1234abcd"
+        )
+        fakeDiscovery.clustersFlow.value = listOf(cluster)
+        testScheduler.advanceUntilIdle()
+
+        assertThat(viewModel.discoveredClusters.value).hasSize(1)
+        assertThat(viewModel.uiState.value.discoveredClusters).hasSize(1)
+        assertThat(viewModel.uiState.value.discoveredClusters.first().clusterName).isEqualTo("lab-cluster")
+
+        // Route switches to metered Cellular WAN: discovery automatically halted
+        routeFlow.value = NetworkRoute.CellularWan(isMetered = true)
+        testScheduler.advanceUntilIdle()
+        assertThat(fakeDiscovery.stopCalls.get()).isEqualTo(2)
+        assertThat(viewModel.discoveredClusters.value).isEmpty()
+        assertThat(viewModel.uiState.value.discoveredClusters).isEmpty()
+    }
 }

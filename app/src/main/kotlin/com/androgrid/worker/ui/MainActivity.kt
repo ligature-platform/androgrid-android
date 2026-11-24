@@ -1,6 +1,7 @@
 package com.androgrid.worker.ui
 
 import android.Manifest
+import android.app.AlertDialog
 import android.app.Application
 import android.content.Context
 import android.content.Intent
@@ -11,8 +12,11 @@ import android.graphics.Typeface
 import android.net.ConnectivityManager
 import android.os.Build
 import android.os.Bundle
+import android.text.InputType
 import android.view.Gravity
+import android.view.View
 import android.widget.Button
+import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -38,11 +42,14 @@ import com.androgrid.worker.capability.DeviceCapabilityProvider
 import com.androgrid.worker.capability.NodeIdProvider
 import com.androgrid.worker.capability.StandardRootChecker
 import com.androgrid.worker.enrollment.EnrollmentCoordinator
+import com.androgrid.worker.enrollment.EnrollmentPayload
 import com.androgrid.worker.enrollment.EnrollmentPayloadParser
 import com.androgrid.worker.enrollment.EnrollmentResult
 import com.androgrid.worker.network.ClusterSettingsRepository
+import com.androgrid.worker.network.DiscoveredCluster
 import com.androgrid.worker.network.NetworkRoute
 import com.androgrid.worker.network.NetworkRouteMonitor
+import com.androgrid.worker.network.NsdClusterDiscoveryManager
 import com.androgrid.worker.network.SharedPreferencesClusterSettingsRepository
 import com.androgrid.worker.service.AndroidServiceController
 import com.androgrid.worker.service.AndroidWorkScheduler
@@ -64,6 +71,10 @@ class MainActivity : ComponentActivity() {
     private var participationController: WorkerParticipationController? = null
 
     private lateinit var statusBannerView: TextView
+    internal lateinit var discoveryCardView: LinearLayout
+    internal lateinit var discoveryHeaderView: TextView
+    internal lateinit var discoveryDetailsView: TextView
+    internal lateinit var connectAndPairButton: Button
     private lateinit var nodeIdView: TextView
     private lateinit var hardwareView: TextView
     private lateinit var osView: TextView
@@ -257,6 +268,48 @@ class MainActivity : ComponentActivity() {
         }
         rootLayout.addView(statusBannerView, bannerParams)
 
+        discoveryCardView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(36, 28, 36, 28)
+            setBackgroundColor(Color.parseColor("#1B3A24")) // Dark emerald container
+            visibility = View.GONE
+        }
+        val cardParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            setMargins(0, 0, 0, 32)
+        }
+
+        discoveryHeaderView = TextView(this).apply {
+            text = "AndroGrid Cluster Detected"
+            textSize = 16f
+            setTextColor(Color.parseColor("#81C784"))
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        discoveryCardView.addView(discoveryHeaderView)
+
+        discoveryDetailsView = TextView(this).apply {
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            setPadding(0, 8, 0, 16)
+        }
+        discoveryCardView.addView(discoveryDetailsView)
+
+        connectAndPairButton = Button(this).apply {
+            text = "Connect & Pair"
+            textSize = 15f
+            setBackgroundColor(Color.parseColor("#2E7D32"))
+            setTextColor(Color.WHITE)
+            setOnClickListener {
+                val cluster = viewModel.uiState.value.discoveredClusters.firstOrNull() ?: return@setOnClickListener
+                handleConnectAndPair(cluster)
+            }
+        }
+        discoveryCardView.addView(connectAndPairButton)
+
+        rootLayout.addView(discoveryCardView, cardParams)
+
         nodeIdView = createMetricView()
         hardwareView = createMetricView()
         osView = createMetricView()
@@ -400,6 +453,97 @@ class MainActivity : ComponentActivity() {
             toggleButton.text = "Start Compute Participation"
             toggleButton.setBackgroundColor(Color.parseColor("#2E7D32")) // Green
         }
+
+        val repo = settingsRepository ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
+        val isUnconfigured = !repo.getSettings().hasMtlsCredentials
+        val cluster = state.discoveredClusters.firstOrNull()
+
+        if (cluster != null && isUnconfigured) {
+            discoveryCardView.visibility = View.VISIBLE
+            discoveryDetailsView.text = "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})"
+        } else {
+            discoveryCardView.visibility = View.GONE
+        }
+    }
+
+    internal fun handleConnectAndPair(cluster: DiscoveredCluster, pairingToken: String? = null) {
+        val repo = settingsRepository ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
+        repo.updateWifiEndpoint(cluster.host, cluster.port)
+
+        if (repo.getSettings().hasMtlsCredentials) {
+            Toast.makeText(this, "Connected to ${cluster.clusterName}! Starting compute participation...", Toast.LENGTH_SHORT).show()
+            viewModel.startParticipation()
+            return
+        }
+
+        if (!pairingToken.isNullOrBlank()) {
+            executeEnrollmentWithToken(cluster, pairingToken)
+            return
+        }
+
+        promptPairingDialog(cluster)
+    }
+
+    private fun promptPairingDialog(cluster: DiscoveredCluster) {
+        val input = EditText(this).apply {
+            hint = "Pairing Token"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.parseColor("#888888"))
+            setBackgroundColor(Color.parseColor("#222222"))
+            setPadding(24, 20, 24, 20)
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("AndroGrid Cluster Detected")
+            .setMessage("Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})\n\nEnter pairing token from orchestrator dashboard or scan QR code:")
+            .setView(input)
+            .setPositiveButton("Connect & Pair") { _, _ ->
+                val token = input.text.toString().trim()
+                if (token.isNotBlank()) {
+                    executeEnrollmentWithToken(cluster, token)
+                } else {
+                    Toast.makeText(this, "Pairing token cannot be empty", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNeutralButton("Scan QR") { _, _ ->
+                val intent = Intent(this@MainActivity, QrScannerActivity::class.java)
+                qrScanLauncher.launch(intent)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    internal fun executeEnrollmentWithToken(cluster: DiscoveredCluster, token: String) {
+        lifecycleScope.launch {
+            val repo = settingsRepository ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
+            try {
+                val effectiveFingerprint = if (cluster.caFingerprint.isNotBlank()) {
+                    cluster.caFingerprint
+                } else {
+                    "0".repeat(64)
+                }
+                val payload = EnrollmentPayload(
+                    clusterEndpoint = cluster.endpoint(),
+                    caFingerprint = effectiveFingerprint,
+                    pairingToken = token,
+                    nodeId = viewModel.uiState.value.nodeId
+                )
+                val coordinator = EnrollmentCoordinator(settingsRepository = repo)
+                val result = coordinator.executeEnrollment(payload, viewModel.uiState.value.nodeId)
+                when (result) {
+                    is EnrollmentResult.Success -> {
+                        Toast.makeText(this@MainActivity, "Device enrolled in cluster! Starting compute participation...", Toast.LENGTH_LONG).show()
+                        viewModel.startParticipation()
+                    }
+                    is EnrollmentResult.Failure -> {
+                        Toast.makeText(this@MainActivity, "Enrollment failed: ${result.errorMessage}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this@MainActivity, "Enrollment error: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     /**
@@ -421,6 +565,7 @@ class MainActivity : ComponentActivity() {
             val capabilityProvider = DeviceCapabilityProvider(rootChecker, systemInfo)
             val batteryProvider = AndroidBatteryStatusProvider(context)
             val serial = NodeIdProvider.getOrCreateNodeId(context)
+            val discoveryManager = app?.clusterDiscoveryManager ?: NsdClusterDiscoveryManager(context)
 
             if (app != null) {
                 return WorkerDashboardViewModel(
@@ -431,7 +576,8 @@ class MainActivity : ComponentActivity() {
                     coordinator = app.lifecycleCoordinator,
                     thermalStatusListener = app.thermalStatusListener,
                     ledgerRepository = app.taskLedgerRepository,
-                    participationController = app.participationController
+                    participationController = app.participationController,
+                    discoveryManager = discoveryManager
                 ) as T
             }
 
@@ -454,7 +600,8 @@ class MainActivity : ComponentActivity() {
                 coordinator = coordinator,
                 thermalStatusListener = thermalListener,
                 ledgerRepository = InMemoryTaskLedgerRepository(),
-                participationController = null
+                participationController = null,
+                discoveryManager = discoveryManager
             ) as T
         }
     }

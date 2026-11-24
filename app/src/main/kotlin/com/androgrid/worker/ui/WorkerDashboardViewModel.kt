@@ -30,8 +30,12 @@ class WorkerDashboardViewModel(
     private val coordinator: WorkerLifecycleCoordinator,
     private val thermalStatusListener: DeviceThermalStatusListener? = null,
     private val ledgerRepository: TaskLedgerRepository = InMemoryTaskLedgerRepository(),
-    private val participationController: WorkerParticipationController? = null
+    private val participationController: WorkerParticipationController? = null,
+    private val discoveryManager: com.androgrid.worker.network.ClusterDiscoveryManager? = null
 ) : ViewModel() {
+
+    val discoveredClusters: StateFlow<List<com.androgrid.worker.network.DiscoveredCluster>> =
+        discoveryManager?.discoveredClusters ?: MutableStateFlow(emptyList())
 
     private val _uiState = MutableStateFlow(createInitialState())
     val uiState: StateFlow<WorkerDashboardState> = _uiState.asStateFlow()
@@ -80,6 +84,15 @@ class WorkerDashboardViewModel(
                 }
             }
         }
+
+        // Observe discovered cluster state flow
+        viewModelScope.launch {
+            discoveredClusters.collect { clusters ->
+                _uiState.update { state ->
+                    state.copy(discoveredClusters = clusters)
+                }
+            }
+        }
     }
 
     private fun createInitialState(): WorkerDashboardState {
@@ -107,11 +120,21 @@ class WorkerDashboardViewModel(
             tasksCompletedCount = ledgerSnapshot.tasksCompletedCount,
             tasksFailedCount = ledgerSnapshot.tasksFailedCount,
             recentEntries = ledgerSnapshot.recentEntries,
-            statusBannerText = "Offline: Execution Paused"
+            statusBannerText = "Offline: Execution Paused",
+            discoveredClusters = discoveryManager?.discoveredClusters?.value ?: emptyList()
         )
     }
 
     private fun onRouteChanged(route: NetworkRoute) {
+        when (route) {
+            is NetworkRoute.LanConnected -> {
+                discoveryManager?.startDiscovery()
+            }
+            is NetworkRoute.CellularWan, NetworkRoute.Offline -> {
+                discoveryManager?.stopDiscovery()
+            }
+        }
+
         val bannerText = when (route) {
             is NetworkRoute.LanConnected -> "LAN Connected: Wi-Fi Direct Sync Active"
             is NetworkRoute.CellularWan -> "Cellular WAN: Disconnected Spot Execution"
@@ -162,5 +185,10 @@ class WorkerDashboardViewModel(
             coordinator.stop()
             coordinator.handleRouteTransition(NetworkRoute.Offline)
         }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        discoveryManager?.stopDiscovery()
     }
 }

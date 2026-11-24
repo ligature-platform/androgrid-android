@@ -51,6 +51,10 @@ class AndroGridApplication : Application() {
         NetworkRouteMonitor(connectivityManager)
     }
 
+    val clusterDiscoveryManager: com.androgrid.worker.network.ClusterDiscoveryManager by lazy {
+        com.androgrid.worker.network.NsdClusterDiscoveryManager(this)
+    }
+
     val thermalStatusListener: DeviceThermalStatusListener by lazy {
         AndroidDeviceThermalStatusListener(this)
     }
