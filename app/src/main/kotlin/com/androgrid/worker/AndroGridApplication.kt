@@ -8,8 +8,10 @@ import com.androgrid.worker.enrollment.AndroidKeyStoreEnrollmentProvider
 import com.androgrid.worker.enrollment.CredentialLifecycleManager
 import com.androgrid.worker.network.ArtifactMemoryCache
 import com.androgrid.worker.network.ArtifactResolver
+import com.androgrid.worker.network.ClusterDiscoveryManager
 import com.androgrid.worker.network.ClusterSettingsRepository
 import com.androgrid.worker.network.NetworkRouteMonitor
+import com.androgrid.worker.network.NsdClusterDiscoveryManager
 import com.androgrid.worker.network.SharedPreferencesClusterSettingsRepository
 import com.androgrid.worker.service.AndroidServiceController
 import com.androgrid.worker.service.AndroidWorkScheduler
@@ -51,8 +53,8 @@ class AndroGridApplication : Application() {
         NetworkRouteMonitor(connectivityManager)
     }
 
-    val clusterDiscoveryManager: com.androgrid.worker.network.ClusterDiscoveryManager by lazy {
-        com.androgrid.worker.network.NsdClusterDiscoveryManager(this)
+    val clusterDiscoveryManager: ClusterDiscoveryManager by lazy {
+        NsdClusterDiscoveryManager(this)
     }
 
     val thermalStatusListener: DeviceThermalStatusListener by lazy {

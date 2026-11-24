@@ -31,6 +31,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.androgrid.worker.AndroGridApplication
+import com.androgrid.worker.telemetry.AndroidDeviceThermalStatusListener
 import com.androgrid.worker.telemetry.InMemoryTaskLedgerRepository
 import com.androgrid.worker.service.WorkerParticipationController
 import com.androgrid.worker.R
@@ -207,11 +208,13 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         participationController?.onUiStarted()
+        viewModel.onUiStarted()
     }
 
     override fun onStop() {
         super.onStop()
         participationController?.onUiStopped()
+        viewModel.onUiStopped()
     }
 
     private fun initDependencies() {
@@ -418,7 +421,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun renderState(state: WorkerDashboardState) {
+    internal fun renderState(state: WorkerDashboardState) {
         statusBannerView.text = state.statusBannerText
 
         val bannerColor = when (state.route) {
@@ -454,8 +457,7 @@ class MainActivity : ComponentActivity() {
             toggleButton.setBackgroundColor(Color.parseColor("#2E7D32")) // Green
         }
 
-        val repo = settingsRepository ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
-        val isUnconfigured = !repo.getSettings().hasMtlsCredentials
+        val isUnconfigured = !state.isConfigured
         val cluster = state.discoveredClusters.firstOrNull()
 
         if (cluster != null && isUnconfigured) {
@@ -468,9 +470,9 @@ class MainActivity : ComponentActivity() {
 
     internal fun handleConnectAndPair(cluster: DiscoveredCluster, pairingToken: String? = null) {
         val repo = settingsRepository ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
-        repo.updateWifiEndpoint(cluster.host, cluster.port)
 
         if (repo.getSettings().hasMtlsCredentials) {
+            repo.updateWifiEndpoint(cluster.host, cluster.port)
             Toast.makeText(this, "Connected to ${cluster.clusterName}! Starting compute participation...", Toast.LENGTH_SHORT).show()
             viewModel.startParticipation()
             return
@@ -494,9 +496,19 @@ class MainActivity : ComponentActivity() {
             setPadding(24, 20, 24, 20)
         }
 
+        val fingerprintDisplay = if (cluster.caFingerprint.isNotBlank()) {
+            "CA Fingerprint: ${cluster.caFingerprint}"
+        } else {
+            "CA Fingerprint: Not advertised (enrollment blocked)"
+        }
+
         AlertDialog.Builder(this)
             .setTitle("AndroGrid Cluster Detected")
-            .setMessage("Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})\n\nEnter pairing token from orchestrator dashboard or scan QR code:")
+            .setMessage(
+                "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})\n" +
+                "$fingerprintDisplay\n\n" +
+                "Enter pairing token from orchestrator dashboard or scan QR code:"
+            )
             .setView(input)
             .setPositiveButton("Connect & Pair") { _, _ ->
                 val token = input.text.toString().trim()
@@ -515,17 +527,17 @@ class MainActivity : ComponentActivity() {
     }
 
     internal fun executeEnrollmentWithToken(cluster: DiscoveredCluster, token: String) {
+        if (cluster.caFingerprint.isBlank()) {
+            Toast.makeText(this, "Enrollment blocked: Missing or invalid cluster CA fingerprint", Toast.LENGTH_LONG).show()
+            return
+        }
+
         lifecycleScope.launch {
             val repo = settingsRepository ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
             try {
-                val effectiveFingerprint = if (cluster.caFingerprint.isNotBlank()) {
-                    cluster.caFingerprint
-                } else {
-                    "0".repeat(64)
-                }
                 val payload = EnrollmentPayload(
                     clusterEndpoint = cluster.endpoint(),
-                    caFingerprint = effectiveFingerprint,
+                    caFingerprint = cluster.caFingerprint,
                     pairingToken = token,
                     nodeId = viewModel.uiState.value.nodeId
                 )
@@ -533,6 +545,8 @@ class MainActivity : ComponentActivity() {
                 val result = coordinator.executeEnrollment(payload, viewModel.uiState.value.nodeId)
                 when (result) {
                     is EnrollmentResult.Success -> {
+                        // Persist Wi-Fi endpoint atomically upon verified enrollment
+                        repo.updateWifiEndpoint(cluster.host, cluster.port)
                         Toast.makeText(this@MainActivity, "Device enrolled in cluster! Starting compute participation...", Toast.LENGTH_LONG).show()
                         viewModel.startParticipation()
                     }
@@ -577,14 +591,15 @@ class MainActivity : ComponentActivity() {
                     thermalStatusListener = app.thermalStatusListener,
                     ledgerRepository = app.taskLedgerRepository,
                     participationController = app.participationController,
-                    discoveryManager = discoveryManager
+                    discoveryManager = discoveryManager,
+                    settingsRepository = app.settingsRepository
                 ) as T
             }
 
             // Fallback for isolated unit/Robolectric tests using plain android.app.Application
             val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             val networkMonitor = NetworkRouteMonitor(connectivityManager).apply { startMonitoring() }
-            val thermalListener = com.androgrid.worker.telemetry.AndroidDeviceThermalStatusListener(context).apply {
+            val thermalListener = AndroidDeviceThermalStatusListener(context).apply {
                 startListening()
             }
             val coordinator = WorkerLifecycleCoordinator(
@@ -592,6 +607,7 @@ class MainActivity : ComponentActivity() {
                 serviceController = AndroidServiceController(context),
                 workScheduler = AndroidWorkScheduler(context)
             )
+            val repo = SharedPreferencesClusterSettingsRepository.getInstance(context)
             return WorkerDashboardViewModel(
                 nodeId = serial,
                 routeFlow = networkMonitor.currentRoute,
@@ -601,7 +617,8 @@ class MainActivity : ComponentActivity() {
                 thermalStatusListener = thermalListener,
                 ledgerRepository = InMemoryTaskLedgerRepository(),
                 participationController = null,
-                discoveryManager = discoveryManager
+                discoveryManager = discoveryManager,
+                settingsRepository = repo
             ) as T
         }
     }
