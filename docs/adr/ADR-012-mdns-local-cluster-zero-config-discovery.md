@@ -41,8 +41,9 @@ We introduce standard Android Network Service Discovery (NSD) for zero-configura
 
 ### 3. Defensive OEM Multicast Handling & Resolution Queueing
 - `NsdClusterDiscoveryManager` acquires `WifiManager.MulticastLock("AndroGridClusterDiscovery")` defensively during active Wi-Fi discovery and releases it when stopping.
-- To prevent `FAILURE_ALREADY_ACTIVE` across Android 9 (API 28) through Android 15 (API 35), `NsdClusterDiscoveryManager` maintains an internal FIFO queue serializing `NsdManager.resolveService` invocations.
-- Session fencing guards against late callbacks from cancelled or stopped discovery sessions.
+- Manages an internal four-state lifecycle state machine (`STOPPED`, `STARTING`, `DISCOVERING`, `STOPPING`) with per-session listeners and monotonic session fencing. Calls to `stopDiscovery()` during the `STARTING` window safely mark the session as stopping and release the lock immediately upon the OS callback arrival, preventing background multicast lock leaks.
+- To prevent `FAILURE_ALREADY_ACTIVE` across Android 9 (API 28) through Android 15 (API 35), `NsdClusterDiscoveryManager` maintains an internal FIFO queue serializing `NsdManager.resolveService` invocations outside lock scopes.
+- Bounded capacity guards: resolve queue depth is capped at 16 with pending service deduplication, and active discovered clusters are capped at 16 items.
 - Incoming TXT records and socket addresses undergo strict LAN validation (rejecting loopback, multicast, link-local, and public WAN addresses). Lowercase 64-character SHA-256 validation sanitizes advertised CA fingerprints.
 
 ### 4. Interactive Dashboard Discovery Card & Verified Pairing
@@ -50,8 +51,8 @@ We introduce standard Android Network Service Discovery (NSD) for zero-configura
   * Header: "AndroGrid Cluster Detected"
   * Details: "Host: <host>:<port> (Cluster: <name>)"
   * Action Button: "[Connect & Pair]"
-- Tapping "[Connect & Pair]" presents a pairing dialog displaying the advertised cluster endpoint and SHA-256 CA fingerprint for operator verification against the orchestrator console before submitting the pairing token.
-- If the cluster advertises a missing or invalid CA fingerprint, enrollment is blocked immediately to prevent MITM interception.
+- Tapping "[Connect & Pair]" presents a pairing dialog displaying the advertised cluster endpoint and SHA-256 CA fingerprint formatted in space-separated 4-character chunks (`ABCD EF12 ...`) for operator verification against the orchestrator terminal before submitting the pairing token.
+- If the cluster advertises a missing or invalid CA fingerprint, zero-config pairing is blocked, the token input is omitted, and the user is guided to QR scan or manual configuration.
 - The Wi-Fi endpoint in `ClusterSettingsRepository` is updated atomically only upon verified, successful enrollment, preventing premature configuration corruption on cancel or failure.
 - Already enrolled nodes do not initiate discovery or show the banner to preserve battery and radio state.
 
