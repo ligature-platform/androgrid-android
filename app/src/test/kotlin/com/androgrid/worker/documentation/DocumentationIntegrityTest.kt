@@ -142,7 +142,8 @@ class DocumentationIntegrityTest {
             "ADR-005-rooted-device-demarcation.md",
             "ADR-006-r8-protobuf-schema-preservation.md",
             "ADR-007-grpc-okhttp-tls-cipher-negotiation.md",
-            "ADR-008-task-execution-ledger-and-lifecycle-persistence.md"
+            "ADR-008-task-execution-ledger-and-lifecycle-persistence.md",
+            "ADR-012-mdns-local-cluster-zero-config-discovery.md"
         )
 
         for (adrFileName in expectedAdrs) {
@@ -167,6 +168,7 @@ class DocumentationIntegrityTest {
 
         val content = matrixFile.readText(Charsets.UTF_8)
         assertThat(content).contains("ISO/IEC/IEEE 29148")
+        assertThat(content).contains("ADR-012")
 
         val requiredRequirementTags = listOf(
             "[REQ-OP-001]",

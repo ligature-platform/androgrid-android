@@ -5,6 +5,9 @@ import androidx.lifecycle.viewModelScope
 import com.androgrid.v1.NetworkTransportType
 import com.androgrid.worker.capability.BatteryStatusProvider
 import com.androgrid.worker.capability.DeviceCapabilityProvider
+import com.androgrid.worker.network.ClusterDiscoveryManager
+import com.androgrid.worker.network.ClusterSettingsRepository
+import com.androgrid.worker.network.DiscoveredCluster
 import com.androgrid.worker.network.NetworkRoute
 import com.androgrid.worker.service.WorkerLifecycleCoordinator
 import com.androgrid.worker.service.WorkerParticipationController
@@ -30,17 +33,35 @@ class WorkerDashboardViewModel(
     private val coordinator: WorkerLifecycleCoordinator,
     private val thermalStatusListener: DeviceThermalStatusListener? = null,
     private val ledgerRepository: TaskLedgerRepository = InMemoryTaskLedgerRepository(),
-    private val participationController: WorkerParticipationController? = null
+    private val participationController: WorkerParticipationController? = null,
+    private val discoveryManager: ClusterDiscoveryManager? = null,
+    private val settingsRepository: ClusterSettingsRepository? = null
 ) : ViewModel() {
+
+    val discoveredClusters: StateFlow<List<DiscoveredCluster>> =
+        discoveryManager?.discoveredClusters ?: MutableStateFlow(emptyList())
 
     private val _uiState = MutableStateFlow(createInitialState())
     val uiState: StateFlow<WorkerDashboardState> = _uiState.asStateFlow()
+
+    private var isUiVisible: Boolean = true
 
     init {
         // Observe route transitions
         viewModelScope.launch {
             routeFlow.collect { route ->
                 onRouteChanged(route)
+            }
+        }
+
+        // Observe cluster settings transitions for credential status
+        if (settingsRepository != null) {
+            viewModelScope.launch {
+                settingsRepository.settingsFlow.collect { settings ->
+                    val configured = settings.hasMtlsCredentials
+                    _uiState.update { it.copy(isConfigured = configured) }
+                    updateDiscoveryState()
+                }
             }
         }
 
@@ -80,6 +101,15 @@ class WorkerDashboardViewModel(
                 }
             }
         }
+
+        // Observe discovered cluster state flow
+        viewModelScope.launch {
+            discoveredClusters.collect { clusters ->
+                _uiState.update { state ->
+                    state.copy(discoveredClusters = clusters)
+                }
+            }
+        }
     }
 
     private fun createInitialState(): WorkerDashboardState {
@@ -90,6 +120,7 @@ class WorkerDashboardViewModel(
         val battery = batteryProvider.getBatteryStatus()
         val thermalStatus = thermalStatusListener?.currentThermalStatus ?: 0
         val ledgerSnapshot = ledgerRepository.ledgerSnapshot.value
+        val initialConfigured = settingsRepository?.getSettings()?.hasMtlsCredentials ?: false
 
         return WorkerDashboardState(
             nodeId = nodeId,
@@ -107,7 +138,9 @@ class WorkerDashboardViewModel(
             tasksCompletedCount = ledgerSnapshot.tasksCompletedCount,
             tasksFailedCount = ledgerSnapshot.tasksFailedCount,
             recentEntries = ledgerSnapshot.recentEntries,
-            statusBannerText = "Offline: Execution Paused"
+            statusBannerText = "Offline: Execution Paused",
+            discoveredClusters = discoveryManager?.discoveredClusters?.value ?: emptyList(),
+            isConfigured = initialConfigured
         )
     }
 
@@ -132,10 +165,34 @@ class WorkerDashboardViewModel(
             )
         }
 
+        updateDiscoveryState()
+
         // Fallback when running without Application-scoped participationController (unit tests)
         if (participationController == null && _uiState.value.isComputeActive) {
             coordinator.handleRouteTransition(route)
         }
+    }
+
+    private fun updateDiscoveryState() {
+        val shouldDiscover = isUiVisible &&
+            _uiState.value.route is NetworkRoute.LanConnected &&
+            !_uiState.value.isConfigured
+
+        if (shouldDiscover) {
+            discoveryManager?.startDiscovery()
+        } else {
+            discoveryManager?.stopDiscovery()
+        }
+    }
+
+    fun onUiStarted() {
+        isUiVisible = true
+        updateDiscoveryState()
+    }
+
+    fun onUiStopped() {
+        isUiVisible = false
+        discoveryManager?.stopDiscovery()
     }
 
     /**
@@ -162,5 +219,10 @@ class WorkerDashboardViewModel(
             coordinator.stop()
             coordinator.handleRouteTransition(NetworkRoute.Offline)
         }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        discoveryManager?.stopDiscovery()
     }
 }

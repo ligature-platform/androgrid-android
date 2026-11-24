@@ -1,5 +1,6 @@
 package com.androgrid.worker.ui
 
+import com.androgrid.worker.network.DiscoveredCluster
 import com.androgrid.worker.network.NetworkRoute
 import com.androgrid.worker.telemetry.TaskLedgerEntry
 
@@ -24,7 +25,9 @@ data class WorkerDashboardState(
     val tasksCompletedCount: Int = 0,
     val tasksFailedCount: Int = 0,
     val recentEntries: List<TaskLedgerEntry> = emptyList(),
-    val statusBannerText: String = "Offline: Execution Paused"
+    val statusBannerText: String = "Offline: Execution Paused",
+    val discoveredClusters: List<DiscoveredCluster> = emptyList(),
+    val isConfigured: Boolean = false
 ) {
     /**
      * Formats RAM in Gigabytes with 1 decimal place.
