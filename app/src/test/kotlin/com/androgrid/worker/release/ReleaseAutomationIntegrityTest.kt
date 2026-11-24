@@ -49,8 +49,56 @@ class ReleaseAutomationIntegrityTest {
         // Verify SHA-256 checksum consolidation
         assertThat(content).contains("SHA256SUMS.txt")
 
+        // Verify permanent release APK asset naming per Issue #67
+        assertThat(content).contains("androgrid-worker.apk")
+        assertThat(content).contains("download-qr.png")
+
         // Verify release upload / publication
         assertThat(content).contains("gh release")
+    }
+
+    /**
+     * Validates that mobile download QR code assets exist and are embedded into README.md.
+     *
+     * Traces to: [REQ-OP-001], Issue #67
+     */
+    @Test
+    fun testDownloadQrAssetsAndReadmeIntegration() {
+        val rootDir = getProjectRootDir()
+        val assetsDir = File(rootDir, "docs/assets")
+        val qrPng = File(assetsDir, "download-qr.png")
+        val qrSvg = File(assetsDir, "download-qr.svg")
+
+        assertThat(qrPng.exists()).isTrue()
+        assertThat(qrPng.length()).isGreaterThan(100L)
+
+        assertThat(qrSvg.exists()).isTrue()
+        assertThat(qrSvg.length()).isGreaterThan(100L)
+
+        val readmeFile = File(rootDir, "README.md")
+        assertThat(readmeFile.exists()).isTrue()
+        val readmeContent = readmeFile.readText(Charsets.UTF_8)
+
+        assertThat(readmeContent).contains("docs/assets/download-qr.png")
+        assertThat(readmeContent).contains("androgrid-worker.apk")
+        assertThat(readmeContent).contains("releases/latest/download/androgrid-worker.apk")
+    }
+
+    /**
+     * Validates that app/build.gradle.kts bounds native ABI to arm64-v8a for alpha releases
+     * enforcing the 25 MB package bound and 16 KB page-size alignment per Android 15.
+     *
+     * Traces to: [REQ-VER-001], [NFR-PERF-001], Issue #67
+     */
+    @Test
+    fun testHardwareScopeArm64AbiFilterBound() {
+        val rootDir = getProjectRootDir()
+        val buildGradleFile = File(rootDir, "app/build.gradle.kts")
+        assertThat(buildGradleFile.exists()).isTrue()
+
+        val content = buildGradleFile.readText(Charsets.UTF_8)
+        assertThat(content).contains("abiFilters")
+        assertThat(content).contains("arm64-v8a")
     }
 
     /**

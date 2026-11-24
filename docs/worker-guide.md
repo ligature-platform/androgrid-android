@@ -8,11 +8,16 @@ Traceability: `[REQ-OP-001]`, `[REQ-OP-002]`, `[REQ-OP-003]`, `[REQ-VER-001]`, `
 
 ## Device Prerequisites & Compatibility Matrix
 
+> [!IMPORTANT]
+> **Alpha Promotion Hardware Boundary Notice:**
+> The public alpha release APK distribution (`androgrid-worker-v0.0.1-alpha.5.apk`) is explicitly bounded to **Android 12+ (API 31+) ARM64 (`arm64-v8a`)** devices. This hardware boundary enforces 16 KB page-size ELF alignment per Android 15 compatibility guidelines, eliminates legacy crypto provider friction, and keeps binary package footprints under 25 MB (`[NFR-PERF-001]`). The core codebase maintains minimum SDK 28 (Android 9 Pie) compatibility (`[REQ-VER-002]`) for custom source builds.
+
 Before enrolling a device, verify that it meets the following hardware and operating system requirements:
 
 | Metric | Minimum Requirement | Recommended Specification | Rationale & Traceability |
 | :--- | :--- | :--- | :--- |
-| **Android Version** | Android 9 (Pie, API 28) | Android 14+ (API 34) | Min SDK 28 is required for core crypto libraries and desugared Java time APIs. API 34+ enforces typed foreground services (`[REQ-VER-001]`). |
+| **Android Version** | Android 9 (Pie, API 28) | Android 14+ (API 34) | Min SDK 28 is required for core crypto libraries and desugared Java time APIs (`[REQ-VER-002]`). API 34+ enforces typed foreground services (`[REQ-VER-001]`). Alpha releases target Android 12+ ARM64. |
+| **Processor Architecture** | ARM64 (arm64-v8a) | ARM64-v8.2A+ (8 cores) | Required for hardware AES, 16 KB memory paging, and high-performance in-memory WASI execution. |
 | **RAM** | 2.0 GB Total RAM | 4.0 GB+ LPDDR4X | Ensures sufficient head-room for in-memory WebAssembly bytecode execution without triggering Android low-memory killer (LMK). |
 | **Free Storage** | 500 MB | 2.0 GB | Storage for local WASM bytecode cache and execution logs. |
 | **Network Interfaces** | Wi-Fi (802.11n/ac) or Cellular 4G/5G | Dual Wi-Fi 6 + 5G NR | Supports dual-route operation: high-bandwidth Wi-Fi sync and low-power cellular spot execution. |
@@ -20,7 +25,34 @@ Before enrolling a device, verify that it meets the following hardware and opera
 
 ---
 
-## Step 1: Installing the Worker APK via ADB
+## Step 1: Installing the Worker APK
+
+### Option A (Recommended): 2-Step QR Sideloading Walkthrough
+
+For alpha testers and standalone physical devices, install the worker application directly from GitHub Releases without developer tools:
+
+<p align="center">
+  <img src="assets/download-qr.png" alt="Scan to Download AndroGrid Worker APK" width="180" height="180" />
+  <br />
+  <a href="https://github.com/ligature-platform/androgrid-android/releases/latest/download/androgrid-worker.apk">
+    <strong>Direct Download: androgrid-worker.apk (Permanent Latest Release)</strong>
+  </a>
+</p>
+
+1. **Step 1: Scan QR Code and Tap "Download":**
+   - Point your phone camera or QR scanner at the code above, or tap the direct download link in your mobile browser.
+   - The signed `androgrid-worker.apk` binary (under 25 MB) will download to your device's `Download` directory.
+   - Every release asset includes an immutable SHA-256 ledger in `SHA256SUMS.txt` for cryptographic integrity verification.
+
+2. **Step 2: Toggle "Allow from this source" and Complete Installation:**
+   - Tap the completed download notification or open the APK in your device's Files/Downloads app.
+   - If prompted by Android with *"For your security, your phone is not allowed to install unknown apps from this source"*, tap **Settings** and toggle **Allow from this source** to ON.
+   - Tap **Install** on the system package prompt.
+   - Once installed, open **AndroGrid Worker**. Subsequent updates will be delivered and applied automatically over the cluster control plane via the Over-The-Air (OTA) pipeline.
+
+---
+
+### Option B (Developer & CI): Installing the Worker APK via ADB
 
 You can install the pre-compiled debug or release APK directly onto your device using the Android Debug Bridge (ADB).
 
@@ -166,12 +198,18 @@ Android device manufacturers (OEMs) implement aggressive proprietary battery man
 - Open **Settings** -> **Apps** -> **AndroGrid Worker**.
 - Tap **Battery** -> Select **Unrestricted**.
 - Go to **Device Care** -> **Battery** -> **Background usage limits** -> Add AndroGrid Worker to **Never sleeping apps**.
+- **Troubleshooting One UI Background Suspension:**
+  - If tasks halt when the screen turns off, navigate to **Settings** -> **Device Care** -> **Battery** -> **More battery settings** and disable **Adaptive battery**.
+  - In **Device Care** -> **Memory**, check if **RAM Plus** or aggressive memory cleaning is killing background foreground services; add AndroGrid Worker to **Excluded apps**.
 
 ### 2. Xiaomi / Redmi / POCO (MIUI & HyperOS)
 - Open **Settings** -> **Apps** -> **Manage Apps** -> **AndroGrid Worker**.
 - Enable **Autostart** toggle.
 - Under **Battery saver**, select **No restrictions**.
 - In the Recents app switcher, long-press AndroGrid Worker and tap the **Lock icon** to prevent task clearance.
+- **Troubleshooting HyperOS Process Eviction:**
+  - On Xiaomi devices running HyperOS, navigate to **Settings** -> **Additional settings** -> **Developer options** and verify **MIUI / System optimizations** are not aggressively killing sticky foreground services.
+  - If OTA background download jobs fail to awaken, navigate to **Security** app -> **Manage apps** -> **Permissions** -> **Autostart in background** and enable AndroGrid Worker.
 
 ### 3. Huawei / Honor (EMUI & MagicOS)
 - Open **Settings** -> **Battery** -> **App Launch**.

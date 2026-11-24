@@ -83,6 +83,7 @@ jobs:
           APK_SRC=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
           if [ -f "${APK_SRC}" ]; then
             cp "${APK_SRC}" "dist/androgrid-worker-${VERSION}.apk"
+            cp "${APK_SRC}" "dist/androgrid-worker.apk"
             cp "${APK_SRC}" "dist/androgrid-worker-release.apk"
           else
             echo "Error: Release APK artifact not found!"
@@ -93,10 +94,35 @@ jobs:
           AAB_SRC=$(find app/build/outputs/bundle/release -name "*.aab" | head -n 1)
           if [ -f "${AAB_SRC}" ]; then
             cp "${AAB_SRC}" "dist/androgrid-worker-${VERSION}.aab"
+            cp "${AAB_SRC}" "dist/androgrid-worker.aab"
             cp "${AAB_SRC}" "dist/androgrid-worker-release.aab"
           else
             echo "Error: Release AAB artifact not found!"
             exit 1
+          fi
+
+          # Copy QR Code download assets
+          if [ -f "docs/assets/download-qr.png" ]; then
+            cp "docs/assets/download-qr.png" dist/
+          fi
+          if [ -f "docs/assets/download-qr.svg" ]; then
+            cp "docs/assets/download-qr.svg" dist/
+          fi
+
+          # Extract Release Signing Certificate Fingerprints
+          if [ -n "${RELEASE_KEYSTORE_PATH}" ] && [ -f "${RELEASE_KEYSTORE_PATH}" ]; then
+            echo "Extracting keystore certificate fingerprints..."
+            keytool -list -v \
+              -keystore "${RELEASE_KEYSTORE_PATH}" \
+              -alias "${RELEASE_KEY_ALIAS}" \
+              -storepass "${RELEASE_KEY_PASSWORD}" > dist/SIGNING_KEY_CERT.txt
+          fi
+
+          # Verify APK signature via apksigner if available in Android SDK
+          APKSIGNER=$(find "${ANDROID_HOME}/build-tools" -name apksigner 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "${APKSIGNER}" ] && [ -x "${APKSIGNER}" ]; then
+            echo "Verifying APK signature and dumping certificate chain..."
+            "${APKSIGNER}" verify --verbose --print-certs "dist/androgrid-worker.apk" > dist/APK_SIGNATURE_VERIFICATION.txt || true
           fi
 
           # Generate cryptographic SHA-256 ledger
