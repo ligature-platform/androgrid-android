@@ -18,10 +18,24 @@ The distributed mobile edge compute worker for **AndroGrid**: executing isolated
 ## Key Capabilities
 
 - **Zero Inbound Mobile Ports (`[INV-001]`):** The worker node never binds to, listens on, or exposes server sockets. All cluster communication originates outbound from the mobile device to the control plane.
-- **Zero Cellular Keepalive and Radio Sleep (`[INV-003]`, `[NFR-POW-001]`):** When operating over metered Cellular WAN, the worker actively terminates underlying gRPC HTTP/2 channels within 200 ms of task receipt, enabling the cellular baseband radio to drop into low-power RRC idle sleep during local execution.
+- **Zero Cellular Keepalive and Rapid Channel Teardown (`[INV-003]`, `[NFR-POW-001]`):** When operating over metered Cellular WAN, the worker actively terminates underlying gRPC HTTP/2 channels within 200 ms of task receipt, avoiding background keepalives and allowing baseband modems to enter carrier-managed RRC idle sleep during local execution.
 - **Android 14+ Typed Foreground Services (`[REQ-VER-001]`):** Implements modern foreground service architectures using `FOREGROUND_SERVICE_TYPE_DATA_SYNC` with backward compatibility down to Android 9 (API 28).
-- **In-Memory WebAssembly Sandbox (`[INV-006]`, `[REQ-VER-003]`):** Unrooted devices execute compute payloads strictly inside an embedded pure-JVM Chicory WebAssembly/WASI Preview 1 runtime. Bytecode is evaluated entirely in memory without writing, emitting, or executing dynamic shared libraries (`.so`) on writable storage, strictly upholding Android SELinux W^X memory policies.
+- **In-Memory WebAssembly Sandbox (`[INV-006]`, `[REQ-VER-003]`):** Unrooted devices execute compute payloads strictly inside an embedded pure-JVM Chicory WebAssembly/WASI Preview 1 interpreter. Bytecode is evaluated entirely in memory without writing, emitting, or executing dynamic shared libraries (`.so`) on writable storage, strictly upholding Android SELinux W^X memory policies.
 - **Dual-Route Interface Monitoring:** Dynamically transitions between high-throughput Wi-Fi declarative state loops and ephemeral cellular unary requests.
+- **Thermal and Battery Admission Gating:** Defers new task acquisition when battery temperature exceeds 38 C or OS reports severe thermal throttling (`THERMAL_STATUS_SEVERE`). AndroGrid does not enforce a universal hardware charging ceiling; users may configure OEM charging protection (such as 80% battery limits on Android 14+ or vendor settings) independently.
+
+---
+
+## Platform Compatibility and Verification Matrix
+
+| Category | Specification | Details |
+| :--- | :--- | :--- |
+| **Declared Minimum SDK** | Android 9.0 (API Level 28) | Manifest baseline (`minSdk=28`). Fallback services without typed FGS flags. |
+| **Recommended Runtime** | Android 14+ (API Level 34+) | Full platform support with typed foreground service (`FOREGROUND_SERVICE_TYPE_DATA_SYNC`). |
+| **Target SDK** | Android 14 (API Level 34) | Compiles against Android 14 platform APIs. |
+| **Verified Testbeds** | Google Pixel 8 (Android 17 Preview) | Primary testbed: CameraX QR pairing, Chicory WASI, OTA upgrades, thermal throttling. |
+| **Legacy Fallback Testbed** | Xiaomi Redmi Note 5 (Android 9.0) | Verified legacy testbed: Chicory WASI execution and fallback foreground service. |
+| **Uncalibrated Sensor Fallback** | Devices lacking battery thermal probes | Battery temperatures <= 0 C are treated as uncalibrated; thermal guard falls back to OS PowerManager thermal status. |
 
 ---
 

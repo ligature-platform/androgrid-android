@@ -12,7 +12,7 @@ The Android client is architected to operate efficiently on battery-powered mobi
 
 1. **[INV-001] Zero Inbound Mobile Ports:** The client never creates `ServerSocket` instances or listens on TCP/UDP ports. All communication initiates outbound toward the host control plane or Cloudflare Anycast ingress.
 2. **[INV-002] Mutual TLS 1.3:** Every network socket strictly enforces mTLS with client certificate verification using modern Android `KeyStore` hardware-backed ECDSA P-256 keys.
-3. **[INV-003] Zero Cellular Keepalive & Radio Sleep:** When operating over Cellular WAN, persistent sockets and heartbeats are prohibited (`[ANTI-001]`). Unary leases close within 200 ms (`[NFR-POW-001]`) to return the baseband modem to low-power Radio Resource Control (RRC) sleep.
+3. **[INV-003] Zero Cellular Keepalive & Rapid Channel Teardown:** When operating over Cellular WAN, persistent sockets and heartbeats are prohibited (`[ANTI-001]`). The client actively terminates channels within 200 ms (`[NFR-POW-001]`) to allow carrier baseband modems to transition into low-power Radio Resource Control (RRC) sleep without keepalive interference.
 4. **[REQ-VER-001] Typed Foreground Service (API 34+):** Android 14+ enforces typed foreground services. The worker invokes `ServiceCompat.startForeground` passing `FOREGROUND_SERVICE_TYPE_DATA_SYNC`.
 5. **[REQ-VER-003] In-Memory W^X Sandbox:** WebAssembly bytecode executes in memory without emitting dynamic library shared objects (`.so`) to writable application storage.
 
@@ -79,9 +79,32 @@ flowchart TD
 ### 2. Cellular Spot Worker (`CellularSpotWorker`)
 - Implemented as a Jetpack `CoroutineWorker` scheduled with battery and charging constraints.
 - Initiates an outbound unary RPC (`ClaimCellularTask`) requesting an available spot task lease.
-- **200 ms Radio Sleep Enforcement (`[NFR-POW-001]`):** Immediately upon receiving `ClaimCellularTaskResponse`, the worker terminates the transport channel, allowing the cellular baseband modem to transition from high-power RRC connected state to idle sleep state.
+- **Sub-200ms Channel Teardown (`[NFR-POW-001]`):** Immediately upon receiving `ClaimCellularTaskResponse`, the worker terminates the transport channel within 200 ms. This eliminates persistent polling and allows the cellular baseband modem to transition into low-power RRC idle sleep according to carrier inactivity timers.
 - Executes compute workload locally in the background.
 - Upon completion, opens a short-lived socket to invoke `SubmitCellularResult` and immediately shuts down again.
+
+---
+
+## Thermal Safety Guard & Admission Control
+
+To safeguard mobile hardware longevity without relying on uncalibrated vendor assertions, the worker implements a dual-variable hysteresis dampener (`ThermalSafetyGuard`):
+
+```mermaid
+stateDiagram-v2
+    [*] --> UNTHROTTLED
+    UNTHROTTLED --> THROTTLED: Temp > 38 C OR Status >= SEVERE (3)
+    THROTTLED --> UNTHROTTLED: Temp <= 35 C AND Status <= LIGHT (1)
+    THROTTLED --> THROTTLED: Cooling in progress (Hysteresis window)
+```
+
+### Thermal Telemetry and Hysteresis Defaults
+- **Temperature Cutoff (`DEFAULT_MAX_BATTERY_TEMP_CELSIUS = 38`):** Computation gating activates when battery temperature exceeds 38 degrees Celsius.
+- **Temperature Recovery (`DEFAULT_RESUME_BATTERY_TEMP_CELSIUS = 35`):** Once throttled, the worker requires battery temperature to drop to 35 degrees Celsius before admitting tasks, preventing high-frequency start-stop cycles.
+- **OS Thermal Status Cutoff (`DEFAULT_MAX_THERMAL_STATUS = 3`):** Corresponds to `PowerManager.THERMAL_STATUS_SEVERE`.
+- **OS Thermal Status Recovery (`DEFAULT_RESUME_THERMAL_STATUS = 1`):** Requires status to return to `PowerManager.THERMAL_STATUS_LIGHT` or `NONE` (0).
+- **Sensor Availability Fallback:** Readings where temperature is <= 0 degrees Celsius are treated as uncalibrated or missing hardware probes. In these circumstances, the temperature check is skipped, and gating relies exclusively on OS PowerManager thermal status.
+- **Task Gating vs In-Flight Interruption:** The thermal guard gates the acquisition and dispatch of new compute tasks (deferring execution in `WifiSyncClient` and returning `Result.retry()` in `CellularSpotWorker`). It does not abruptly terminate running WASI workloads midway through execution.
+- **Charging Protection:** Work admission requires battery level >= 20% or active AC/USB charging. AndroGrid does not enforce a universal charging ceiling; users may configure OEM charging protection (such as 80% maximum charge limits on Android 14+ or vendor settings) independently.
 
 ---
 
