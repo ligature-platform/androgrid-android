@@ -44,6 +44,12 @@ google-services.json
 # Android Profiling
 *.hprof
 
+# Screen captures, frame buffers & raw dumps
+*.raw
+*.png
+!app/src/main/res/**/*.png
+!docs/assets/**/*.png
+
 # Security, Certificates & Secrets
 *.pem
 *.key
