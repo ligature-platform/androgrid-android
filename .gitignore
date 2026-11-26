@@ -37,6 +37,9 @@ render.experimental.xml
 dist/
 /dist/
 *.keystore
+*.bks
+keystore.properties
+signing.properties
 
 # Google Services (e.g. APIs or Firebase)
 google-services.json
@@ -53,9 +56,14 @@ google-services.json
 # Security, Certificates & Secrets
 *.pem
 *.key
+*.pk8
 *.p12
 *.pfx
 *.crt
+*.csr
+*.srl
+pki/
+/pki/
 .env*
 !*.env.example
 credentials.json
