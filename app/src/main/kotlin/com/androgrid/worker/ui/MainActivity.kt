@@ -51,7 +51,9 @@ import com.androgrid.worker.network.DiscoveredCluster
 import com.androgrid.worker.network.NetworkRoute
 import com.androgrid.worker.network.NetworkRouteMonitor
 import com.androgrid.worker.network.NsdClusterDiscoveryManager
+import com.androgrid.worker.network.PreFlightProbeResult
 import com.androgrid.worker.network.SharedPreferencesClusterSettingsRepository
+import com.androgrid.worker.network.SocketReachabilityProber
 import com.androgrid.worker.service.AndroidServiceController
 import com.androgrid.worker.service.AndroidWorkScheduler
 import com.androgrid.worker.service.WorkerLifecycleCoordinator
@@ -86,6 +88,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var recentLedgerView: TextView
     private lateinit var toggleButton: Button
     private lateinit var scanEnrollmentButton: Button
+    internal lateinit var manualEndpointButton: Button
     private lateinit var settingsButton: Button
 
     private val qrScanLauncher = registerForActivityResult(
@@ -181,12 +184,42 @@ class MainActivity : ComponentActivity() {
 
     internal fun handleScannedQrPayload(rawContent: String) {
         lifecycleScope.launch {
-            val repo = settingsRepository ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
             try {
                 val payload = EnrollmentPayloadParser.parse(rawContent)
-                val coordinator = EnrollmentCoordinator(
-                    settingsRepository = repo
-                )
+                val (host, port) = payload.parseEndpoint()
+
+                // Non-blocking pre-flight reachability check [REQ-OP-001], Gate L-02
+                val probeResult = SocketReachabilityProber.probe(host, port, timeoutMs = 2500)
+                if (probeResult is PreFlightProbeResult.Unreachable) {
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Cluster Pre-Flight Check Failed")
+                        .setMessage(
+                            "Target: $host:$port\n\n" +
+                            "${probeResult.message}\n\n" +
+                            "Actionable Guidance:\n" +
+                            "${probeResult.actionableAdvice}\n\n" +
+                            "Do you wish to proceed with enrollment anyway?"
+                        )
+                        .setPositiveButton("Proceed") { _, _ ->
+                            executeEnrollmentPayload(payload)
+                        }
+                        .setNegativeButton("Cancel", null)
+                        .show()
+                    return@launch
+                }
+
+                executeEnrollmentPayload(payload)
+            } catch (e: Exception) {
+                Toast.makeText(this@MainActivity, "Invalid QR payload: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    internal fun executeEnrollmentPayload(payload: EnrollmentPayload) {
+        lifecycleScope.launch {
+            val repo = settingsRepository ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
+            try {
+                val coordinator = EnrollmentCoordinator(settingsRepository = repo)
                 val nodeId = viewModel.uiState.value.nodeId
                 val result = coordinator.executeEnrollment(payload, nodeId)
 
@@ -200,7 +233,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             } catch (e: Exception) {
-                Toast.makeText(this@MainActivity, "Invalid QR payload: ${e.message}", Toast.LENGTH_LONG).show()
+                Toast.makeText(this@MainActivity, "Enrollment error: ${e.message}", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -349,6 +382,23 @@ class MainActivity : ComponentActivity() {
         }
         rootLayout.addView(scanEnrollmentButton, scanParams)
 
+        manualEndpointButton = Button(this).apply {
+            text = "Manual Endpoint Connect"
+            textSize = 15f
+            setBackgroundColor(Color.parseColor("#37474F")) // Slate gray
+            setTextColor(Color.WHITE)
+            setOnClickListener {
+                showManualEndpointDialog()
+            }
+        }
+        val manualParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            setMargins(0, 16, 0, 0)
+        }
+        rootLayout.addView(manualEndpointButton, manualParams)
+
         toggleButton = Button(this).apply {
             text = "Start Compute Participation"
             textSize = 16f
@@ -463,6 +513,15 @@ class MainActivity : ComponentActivity() {
         if (cluster != null && isUnconfigured) {
             discoveryCardView.visibility = View.VISIBLE
             discoveryDetailsView.text = "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})"
+            discoveryDetailsView.setTextColor(Color.WHITE)
+
+            lifecycleScope.launch {
+                val probe = SocketReachabilityProber.probe(cluster.host, cluster.port, timeoutMs = 1500)
+                if (probe is PreFlightProbeResult.Unreachable) {
+                    discoveryDetailsView.text = "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})\n⚠️ Reachability Warning: ${probe.actionableAdvice}"
+                    discoveryDetailsView.setTextColor(Color.parseColor("#FFCC80"))
+                }
+            }
         } else {
             discoveryCardView.visibility = View.GONE
         }
@@ -517,7 +576,27 @@ class MainActivity : ComponentActivity() {
             .setPositiveButton("Connect & Pair") { _, _ ->
                 val token = input.text.toString().trim()
                 if (token.isNotBlank()) {
-                    executeEnrollmentWithToken(cluster, token)
+                    lifecycleScope.launch {
+                        val probe = SocketReachabilityProber.probe(cluster.host, cluster.port, timeoutMs = 2500)
+                        if (probe is PreFlightProbeResult.Unreachable) {
+                            AlertDialog.Builder(this@MainActivity)
+                                .setTitle("Cluster Pre-Flight Check Failed")
+                                .setMessage(
+                                    "Target: ${cluster.endpoint()}\n\n" +
+                                    "${probe.message}\n\n" +
+                                    "Actionable Guidance:\n" +
+                                    "${probe.actionableAdvice}\n\n" +
+                                    "Do you wish to proceed with enrollment anyway?"
+                                )
+                                .setPositiveButton("Proceed") { _, _ ->
+                                    executeEnrollmentWithToken(cluster, token)
+                                }
+                                .setNegativeButton("Cancel", null)
+                                .show()
+                        } else {
+                            executeEnrollmentWithToken(cluster, token)
+                        }
+                    }
                 } else {
                     Toast.makeText(this, "Pairing token cannot be empty", Toast.LENGTH_SHORT).show()
                 }
@@ -528,6 +607,120 @@ class MainActivity : ComponentActivity() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    internal fun showManualEndpointDialog() {
+        val repo = settingsRepository ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
+        val currentSettings = repo.getSettings()
+
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 32, 48, 16)
+        }
+
+        val hostInput = EditText(this).apply {
+            hint = "Host IP or Hostname (e.g. 10.100.102.6)"
+            setText(if (currentSettings.wifiHost != "127.0.0.1") currentSettings.wifiHost else "")
+            inputType = InputType.TYPE_CLASS_TEXT
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.parseColor("#888888"))
+        }
+        val portInput = EditText(this).apply {
+            hint = "gRPC Port (default: 50051)"
+            setText(currentSettings.wifiPort.toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.parseColor("#888888"))
+        }
+        val tokenInput = EditText(this).apply {
+            hint = "Pairing Token (optional if enrolled)"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.parseColor("#888888"))
+        }
+        val caInput = EditText(this).apply {
+            hint = "CA Fingerprint (64 hex characters, optional)"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.parseColor("#888888"))
+        }
+
+        layout.addView(TextView(this).apply { text = "Host Address:"; setTextColor(Color.LTGRAY) })
+        layout.addView(hostInput)
+        layout.addView(TextView(this).apply { text = "Port:"; setTextColor(Color.LTGRAY) })
+        layout.addView(portInput)
+        layout.addView(TextView(this).apply { text = "Pairing Token:"; setTextColor(Color.LTGRAY) })
+        layout.addView(tokenInput)
+        layout.addView(TextView(this).apply { text = "CA Fingerprint:"; setTextColor(Color.LTGRAY) })
+        layout.addView(caInput)
+
+        AlertDialog.Builder(this)
+            .setTitle("Manual Cluster Endpoint Fallback")
+            .setView(layout)
+            .setPositiveButton("Probe & Connect") { _, _ ->
+                val host = hostInput.text.toString().trim()
+                val portStr = portInput.text.toString().trim()
+                val port = portStr.toIntOrNull() ?: 50051
+                val token = tokenInput.text.toString().trim()
+                val ca = caInput.text.toString().trim()
+
+                if (host.isBlank()) {
+                    Toast.makeText(this, "Host address cannot be empty", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+
+                lifecycleScope.launch {
+                    val probeResult = SocketReachabilityProber.probe(host, port, timeoutMs = 2500)
+                    if (probeResult is PreFlightProbeResult.Unreachable) {
+                        AlertDialog.Builder(this@MainActivity)
+                            .setTitle("Pre-Flight Check Failed")
+                            .setMessage(
+                                "Target: $host:$port\n\n" +
+                                "${probeResult.message}\n\n" +
+                                "Actionable Guidance:\n" +
+                                "${probeResult.actionableAdvice}\n\n" +
+                                "Do you want to save this endpoint anyway?"
+                            )
+                            .setPositiveButton("Save Anyway") { _, _ ->
+                                applyManualSettings(host, port, token, ca)
+                            }
+                            .setNegativeButton("Cancel", null)
+                            .show()
+                    } else {
+                        Toast.makeText(this@MainActivity, "Host $host:$port is reachable!", Toast.LENGTH_SHORT).show()
+                        applyManualSettings(host, port, token, ca)
+                    }
+                }
+            }
+            .setNeutralButton("Scan QR") { _, _ ->
+                val intent = Intent(this@MainActivity, QrScannerActivity::class.java)
+                qrScanLauncher.launch(intent)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    internal fun applyManualSettings(host: String, port: Int, token: String, caFingerprint: String) {
+        val repo = settingsRepository ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
+        val current = repo.getSettings()
+        repo.updateSettings(current.copy(wifiHost = host, wifiPort = port))
+
+        if (token.isNotBlank() && caFingerprint.length == 64) {
+            val payload = EnrollmentPayload(
+                clusterEndpoint = "$host:$port",
+                caFingerprint = caFingerprint,
+                pairingToken = token,
+                nodeId = viewModel.uiState.value.nodeId,
+                directIp = host,
+                directPort = port
+            )
+            executeEnrollmentPayload(payload)
+        } else if (current.hasMtlsCredentials) {
+            Toast.makeText(this, "Endpoint updated to $host:$port. Starting compute...", Toast.LENGTH_SHORT).show()
+            viewModel.startParticipation()
+        } else {
+            Toast.makeText(this, "Endpoint updated to $host:$port. Please pair or provision mTLS credentials.", Toast.LENGTH_LONG).show()
+        }
     }
 
     internal fun executeEnrollmentWithToken(cluster: DiscoveredCluster, token: String) {

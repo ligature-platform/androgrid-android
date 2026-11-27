@@ -182,12 +182,51 @@ class EnrollmentPayloadTest {
             caFingerprint = validSha256Fingerprint,
             pairingToken = "tok-1",
             nodeId = "node_a",
-            expiresAtEpochSeconds = 2000L
+            expiresAtEpochSeconds = 2000L,
+            directIp = "10.100.102.6",
+            directPort = 50051
         )
 
         val json = payload.toJson()
         val parsed = EnrollmentPayloadParser.parse(json)
 
         assertThat(parsed).isEqualTo(payload)
+        val (host, port) = parsed.parseEndpoint()
+        assertThat(host).isEqualTo("10.100.102.6")
+        assertThat(port).isEqualTo(50051)
+    }
+
+    @Test
+    fun parseJson_withDirectEndpoint_prefersDirectEndpoint() {
+        val json = """
+            {
+                "cluster_endpoint": "https://androgrid.local:50051",
+                "ca_fingerprint": "$validSha256Fingerprint",
+                "pairing_token": "token-direct-123",
+                "direct_ip": "10.100.102.6",
+                "direct_port": 50051
+            }
+        """.trimIndent()
+
+        val payload = EnrollmentPayloadParser.parse(json)
+        assertThat(payload.directIp).isEqualTo("10.100.102.6")
+        assertThat(payload.directPort).isEqualTo(50051)
+
+        val (host, port) = payload.parseEndpoint()
+        assertThat(host).isEqualTo("10.100.102.6")
+        assertThat(port).isEqualTo(50051)
+    }
+
+    @Test
+    fun parseUri_withDirectEndpoint_succeeds() {
+        val uri = "androgrid://enroll?endpoint=androgrid.local:50051&token=tok-direct&ca=$validSha256Fingerprint&direct_ip=10.100.102.6&direct_port=50051"
+
+        val payload = EnrollmentPayloadParser.parse(uri)
+        assertThat(payload.directIp).isEqualTo("10.100.102.6")
+        assertThat(payload.directPort).isEqualTo(50051)
+
+        val (host, port) = payload.parseEndpoint()
+        assertThat(host).isEqualTo("10.100.102.6")
+        assertThat(port).isEqualTo(50051)
     }
 }

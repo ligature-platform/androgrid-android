@@ -20,7 +20,9 @@ data class EnrollmentPayload(
     val caFingerprint: String,
     val pairingToken: String,
     val nodeId: String? = null,
-    val expiresAtEpochSeconds: Long? = null
+    val expiresAtEpochSeconds: Long? = null,
+    val directIp: String? = null,
+    val directPort: Int? = null
 ) {
     init {
         require(clusterEndpoint.isNotBlank()) { "cluster_endpoint must not be blank" }
@@ -31,12 +33,15 @@ data class EnrollmentPayload(
     }
 
     /**
-     * Resolves host and port components from clusterEndpoint.
+     * Resolves host and port components, preferring directIp and directPort when present.
      *
      * @param defaultPort Default port if unspecified in endpoint string (defaults to 50051).
      * @return Pair containing the host string and integer port.
      */
     fun parseEndpoint(defaultPort: Int = 50051): Pair<String, Int> {
+        if (!directIp.isNullOrBlank() && directPort != null && directPort > 0) {
+            return Pair(directIp, directPort)
+        }
         val trimmed = clusterEndpoint.trim()
         val colonIndex = trimmed.lastIndexOf(':')
         return if (colonIndex > 0 && colonIndex < trimmed.length - 1) {
@@ -71,6 +76,8 @@ data class EnrollmentPayload(
         obj.put("pairing_token", pairingToken)
         nodeId?.let { obj.put("node_id", it) }
         expiresAtEpochSeconds?.let { obj.put("expires_at_epoch_s", it) }
+        directIp?.let { obj.put("direct_ip", it) }
+        directPort?.let { obj.put("direct_port", it) }
         return obj.toString()
     }
 }
@@ -132,12 +139,22 @@ object EnrollmentPayloadParser {
                 obj.getLong("expires_at_epoch_seconds")
             } else null
 
+            val directIp = if (obj.has("direct_ip") && !obj.isNull("direct_ip")) {
+                obj.getString("direct_ip").trim().takeIf { it.isNotEmpty() }
+            } else null
+
+            val directPort = if (obj.has("direct_port") && !obj.isNull("direct_port")) {
+                obj.getInt("direct_port").takeIf { it > 0 }
+            } else null
+
             return EnrollmentPayload(
                 clusterEndpoint = endpoint,
                 caFingerprint = ca,
                 pairingToken = token,
                 nodeId = nodeId,
-                expiresAtEpochSeconds = expires
+                expiresAtEpochSeconds = expires,
+                directIp = directIp,
+                directPort = directPort
             )
         } catch (e: JSONException) {
             throw IllegalArgumentException("Malformed JSON pairing payload: ${e.message}", e)
@@ -171,12 +188,17 @@ object EnrollmentPayloadParser {
             require(token.isNotBlank()) { "URI query must contain token" }
             require(ca.isNotBlank()) { "URI query must contain ca" }
 
+            val directIp = queryMap["direct_ip"]?.trim()?.takeIf { it.isNotEmpty() }
+            val directPort = queryMap["direct_port"]?.toIntOrNull()?.takeIf { it > 0 }
+
             return EnrollmentPayload(
                 clusterEndpoint = endpoint,
                 caFingerprint = ca,
                 pairingToken = token,
                 nodeId = nodeId,
-                expiresAtEpochSeconds = expires
+                expiresAtEpochSeconds = expires,
+                directIp = directIp,
+                directPort = directPort
             )
         } catch (e: Exception) {
             if (e is IllegalArgumentException) throw e
