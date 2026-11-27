@@ -107,13 +107,43 @@ Generate worker credentials natively in pure Rust without external OpenSSL depen
 ```bash
 # Generate worker keypair, CSR, and signed certificate in ./pki/worker:
 androgrid-cli cert worker --node-id node_pixel_7_01 --ca-dir ./deploy/pki --out ./pki/worker
+```
 
-# Direct headless provisioning to the application-private PKI directory:
-# PkiCredentialLoader discovers ca.crt, client.crt, and client.key automatically.
+##### Headless Provisioning to Device Storage
+
+For non-rooted debug builds, direct `adb push` to `/data/user/0/...` fails with `Permission denied`. Stage the files into `/data/local/tmp` and copy them into application storage using `run-as`:
+
+```bash
+# 1. Stage files into public temporary directory:
+adb push ./pki/worker/client.crt /data/local/tmp/client.crt
+adb push ./pki/worker/client.key /data/local/tmp/client.key
+adb push ./pki/worker/ca.crt /data/local/tmp/ca.crt
+
+# 2. Create private PKI directory and copy files via run-as (debug builds only):
+adb shell run-as com.androgrid.worker mkdir -p files/pki
+adb shell run-as com.androgrid.worker cp /data/local/tmp/client.crt files/pki/client.crt
+adb shell run-as com.androgrid.worker cp /data/local/tmp/client.key files/pki/client.key
+adb shell run-as com.androgrid.worker cp /data/local/tmp/ca.crt files/pki/ca.crt
+
+# 3. Clean up temporary staged files from /data/local/tmp:
+adb shell rm /data/local/tmp/client.crt /data/local/tmp/client.key /data/local/tmp/ca.crt
+```
+
+For rooted development devices or emulators with root access:
+
+```bash
+adb root
+adb shell mkdir -p /data/user/0/com.androgrid.worker/files/pki
 adb push ./pki/worker/client.crt /data/user/0/com.androgrid.worker/files/pki/client.crt
 adb push ./pki/worker/client.key /data/user/0/com.androgrid.worker/files/pki/client.key
 adb push ./pki/worker/ca.crt /data/user/0/com.androgrid.worker/files/pki/ca.crt
 ```
+
+> [!TIP]
+> After provisioning, remove private keys from the host workstation to maintain credential hygiene:
+> ```bash
+> rm -f ./pki/worker/client.key
+> ```
 
 #### Method B2: Generating the Client Key and Certificate with OpenSSL
 
@@ -151,7 +181,7 @@ openssl pkcs12 -export \
 | `-genkey -noout` | Directly emits the private key in SEC1/PKCS#8 PEM format without printing curve parameter metadata. |
 | `-subj "/CN=.../OU=Edge Compute"` | Sets X.509 Distinguished Name fields. Enforces `OU=Edge Compute` (`[INV-002]`). |
 | `-export -out client.p12` | Constructs a PKCS#12 (PFX) cryptographic archive containing both the public certificate chain and the private key. |
-| `-password pass:<PASSWORD>` | Encrypts the PKCS#12 keystore using password-based encryption, protecting the private key in transit. |
+| `-password pass:<OPERATOR_CHOSEN_PASSWORD>` | Encrypts the PKCS#12 keystore using password-based encryption, protecting the private key in transit. |
 
 ### Provisioning `client.p12` to the Android Device
 
@@ -167,6 +197,11 @@ In the AndroGrid Worker application:
 2. Tap **Import Client Certificate**.
 3. Select `/sdcard/Download/client.p12` and enter the chosen password.
 4. The key is securely stored in the hardware-backed Android KeyStore.
+5. Once imported, delete the unencrypted archive from device storage and workstation:
+   ```bash
+   adb shell rm -f /sdcard/Download/client.p12
+   rm -f client.p12 client_node_pixel_7_01.key
+   ```
 
 ---
 
