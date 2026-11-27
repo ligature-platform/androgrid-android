@@ -35,8 +35,10 @@ render.experimental.xml
 # Keystore files
 *.jks
 dist/
-/dist/
 *.keystore
+*.bks
+keystore.properties
+signing.properties
 
 # Google Services (e.g. APIs or Firebase)
 google-services.json
@@ -44,12 +46,22 @@ google-services.json
 # Android Profiling
 *.hprof
 
+# Screen captures, frame buffers & raw dumps
+*.raw
+*.png
+!app/src/main/res/**/*.png
+!docs/assets/**/*.png
+
 # Security, Certificates & Secrets
 *.pem
 *.key
+*.pk8
 *.p12
 *.pfx
 *.crt
+*.csr
+*.srl
+pki/
 .env*
 !*.env.example
 credentials.json

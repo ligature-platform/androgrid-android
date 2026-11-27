@@ -96,13 +96,58 @@ The fastest and most secure method to onboard mobile workers is single-scan QR c
 
 ---
 
-### Option B (Manual / Headless): PKCS#12 Archive File Import
+### Option B (Manual / Headless): PKCS#12 Archive or Direct PKI Files Import
 
-For headless CI test runners or emulators lacking camera hardware, you can manually generate keys using OpenSSL and import a `.p12` archive:
+For headless CI test runners, automation environments, or emulators lacking camera hardware, you can provision credentials using either `androgrid-cli cert worker` or OpenSSL:
 
-#### Generating the Client Key and Certificate with OpenSSL
+#### Method B1: Native `androgrid-cli` Worker PKI Generation (Recommended)
 
-If you are enrolling a new device named `node_pixel_7_01`, run the following commands on your cluster management workstation:
+Generate worker credentials natively in pure Rust without external OpenSSL dependencies:
+
+```bash
+# Generate worker keypair, CSR, and signed certificate in ./pki/worker:
+androgrid-cli cert worker --node-id node_pixel_7_01 --ca-dir ./deploy/pki --out ./pki/worker
+```
+
+##### Headless Provisioning to Device Storage
+
+For non-rooted debug builds, direct `adb push` to `/data/user/0/...` fails with `Permission denied`. Stage the files into `/data/local/tmp` and copy them into application storage using `run-as`:
+
+```bash
+# 1. Stage files into public temporary directory:
+adb push ./pki/worker/client.crt /data/local/tmp/client.crt
+adb push ./pki/worker/client.key /data/local/tmp/client.key
+adb push ./pki/worker/ca.crt /data/local/tmp/ca.crt
+
+# 2. Create private PKI directory and copy files via run-as (debug builds only):
+adb shell run-as com.androgrid.worker mkdir -p files/pki
+adb shell run-as com.androgrid.worker cp /data/local/tmp/client.crt files/pki/client.crt
+adb shell run-as com.androgrid.worker cp /data/local/tmp/client.key files/pki/client.key
+adb shell run-as com.androgrid.worker cp /data/local/tmp/ca.crt files/pki/ca.crt
+
+# 3. Clean up temporary staged files from /data/local/tmp:
+adb shell rm /data/local/tmp/client.crt /data/local/tmp/client.key /data/local/tmp/ca.crt
+```
+
+For rooted development devices or emulators with root access:
+
+```bash
+adb root
+adb shell mkdir -p /data/user/0/com.androgrid.worker/files/pki
+adb push ./pki/worker/client.crt /data/user/0/com.androgrid.worker/files/pki/client.crt
+adb push ./pki/worker/client.key /data/user/0/com.androgrid.worker/files/pki/client.key
+adb push ./pki/worker/ca.crt /data/user/0/com.androgrid.worker/files/pki/ca.crt
+```
+
+> [!TIP]
+> After provisioning, remove private keys from the host workstation to maintain credential hygiene:
+> ```bash
+> rm -f ./pki/worker/client.key
+> ```
+
+#### Method B2: Generating the Client Key and Certificate with OpenSSL
+
+If generating manually with OpenSSL for node `node_pixel_7_01`:
 
 ```bash
 # 1. Generate an unencrypted ECDSA private key using the NIST P-256 curve:
@@ -111,7 +156,7 @@ openssl ecparam -name prime256v1 -genkey -noout -out client_node_pixel_7_01.key
 # 2. Create a Certificate Signing Request (CSR) specifying the device identity:
 openssl req -new -key client_node_pixel_7_01.key \
   -out client_node_pixel_7_01.csr \
-  -subj "/CN=node_pixel_7_01/O=AndroGrid Cluster/OU=Mobile Worker"
+  -subj "/CN=node_pixel_7_01/O=AndroGrid Worker/OU=Edge Compute"
 
 # 3. Sign the CSR with the cluster Root CA (valid for 365 days):
 openssl x509 -req -in client_node_pixel_7_01.csr \
@@ -119,35 +164,28 @@ openssl x509 -req -in client_node_pixel_7_01.csr \
   -out client_node_pixel_7_01.crt -days 365 -sha256
 
 # 4. Package the certificate, private key, and Root CA into an encrypted PKCS#12 bundle:
-# Note: Modern OpenSSL 3.x defaults to PBES2/AES-256 keybags which Android KeyStore fails to unwrap.
-# The explicit 3DES flags (-certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1) are required for Android compatibility.
+# Replace <PASSWORD> with an operator-chosen strong password.
 openssl pkcs12 -export \
   -inkey client_node_pixel_7_01.key \
   -in client_node_pixel_7_01.crt \
   -certfile deploy/pki/ca.crt \
   -out client.p12 \
-  -certpbe PBE-SHA1-3DES \
-  -keypbe PBE-SHA1-3DES \
-  -macalg sha1 \
-  -password pass:androgrid_secure_pki
+  -password pass:<OPERATOR_CHOSEN_PASSWORD>
 ```
 
 ### OpenSSL Argument Reference
 
 | Flag / Option | Cryptographic Purpose & Architectural Significance |
 | :--- | :--- |
-| `ecparam -name prime256v1` | Selects NIST curve P-256 (FIPS 186-4). Provides 128-bit security with ultra-fast scalar multiplication on mobile ARM processors. |
+| `ecparam -name prime256v1` | Selects NIST curve P-256 (FIPS 186-4). Provides 128-bit security with fast scalar multiplication on mobile ARM processors. |
 | `-genkey -noout` | Directly emits the private key in SEC1/PKCS#8 PEM format without printing curve parameter metadata. |
-| `-subj "/CN=.../O=..."` | Sets X.509 Distinguished Name fields. The Common Name (CN) is used by the orchestrator for node audit logging. |
+| `-subj "/CN=.../OU=Edge Compute"` | Sets X.509 Distinguished Name fields. Enforces `OU=Edge Compute` (`[INV-002]`). |
 | `-export -out client.p12` | Constructs a PKCS#12 (PFX) cryptographic archive containing both the public certificate chain and the private key. |
-| `-certpbe PBE-SHA1-3DES` | Enforces 3DES PKCS#12 encryption for certificates, required by Android KeyStore BouncyCastle provider. |
-| `-keypbe PBE-SHA1-3DES` | Enforces 3DES PKCS#12 encryption for private key bags, preventing `exception unwrapping private key`. |
-| `-macalg sha1` | Enforces SHA-1 MAC digest for archive verification integrity under Android KeyStore provider expectations. |
-| `-password pass:androgrid_secure_pki` | Encrypts the PKCS#12 keystore using password-based encryption, protecting the private key in transit. |
+| `-password pass:<OPERATOR_CHOSEN_PASSWORD>` | Encrypts the PKCS#12 keystore using password-based encryption, protecting the private key in transit. |
 
 ### Provisioning `client.p12` to the Android Device
 
-Push the generated `client.p12` and `ca.crt` to the device storage or import via the in-app settings UI:
+Push the generated `client.p12` to the device storage or import via the in-app settings UI:
 
 ```bash
 # Push PKCS#12 file to device downloads folder:
@@ -157,8 +195,13 @@ adb push client.p12 /sdcard/Download/client.p12
 In the AndroGrid Worker application:
 1. Open **Settings** (gear icon in the top right).
 2. Tap **Import Client Certificate**.
-3. Select `/sdcard/Download/client.p12` and enter password `androgrid_secure_pki`.
+3. Select `/sdcard/Download/client.p12` and enter the chosen password.
 4. The key is securely stored in the hardware-backed Android KeyStore.
+5. Once imported, delete the unencrypted archive from device storage and workstation:
+   ```bash
+   adb shell rm -f /sdcard/Download/client.p12
+   rm -f client.p12 client_node_pixel_7_01.key
+   ```
 
 ---
 
