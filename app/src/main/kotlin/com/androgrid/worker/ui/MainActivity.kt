@@ -253,7 +253,11 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         discoveryProbeJob?.cancel()
+        discoveryProbeJob = null
+        lastProbedEndpoint = null
+        currentProbeAdvice = null
         discoveryFallbackJob?.cancel()
+        discoveryFallbackJob = null
         participationController?.onUiStopped()
         viewModel.onUiStopped()
     }
@@ -520,6 +524,8 @@ class MainActivity : ComponentActivity() {
 
         if (cluster != null && isUnconfigured) {
             discoveryFallbackJob?.cancel()
+            discoveryFallbackJob = null
+            discoveryFallbackTriggered = false
             discoveryCardView.visibility = View.VISIBLE
             val endpoint = cluster.endpoint()
 

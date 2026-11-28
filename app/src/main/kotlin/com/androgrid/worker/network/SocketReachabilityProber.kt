@@ -3,6 +3,7 @@ package com.androgrid.worker.network
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
 import java.net.ConnectException
 import java.net.InetAddress
@@ -25,6 +26,12 @@ import kotlin.coroutines.resume
  * On coroutine cancellation or supersession, actively aborts pending connection attempts
  * by closing the underlying native socket via [suspendCancellableCoroutine] cancellation callback,
  * freeing carrier threads immediately without waiting for OS socket timeouts.
+ *
+ * API-28 Limitation Note:
+ * On Android API 28 (Pie) and certain wireless access points, mDNS hostnames (.local) may fail
+ * system DNS resolution if multicast DNS is filtered. When resolving hostnames fails with
+ * [UnknownHostException], prober reports reachability failure with direct IPv4 fallback guidance
+ * while preserving full TLS certificate verification.
  *
  * Traces to: [REQ-OP-001], [INV-001], [INV-002], Gate L-02
  */
@@ -70,102 +77,113 @@ object SocketReachabilityProber {
             )
         }
 
-        return withContext(Dispatchers.IO) {
-            suspendCancellableCoroutine { continuation ->
-                val socket = Socket()
+        val result = withTimeoutOrNull(timeoutMs.toLong() + 100L) {
+            withContext(Dispatchers.IO) {
+                suspendCancellableCoroutine { continuation ->
+                    val socket = Socket()
 
-                continuation.invokeOnCancellation {
-                    try {
-                        socket.close()
-                    } catch (_: Throwable) {}
-                }
-
-                try {
-                    // If host is numeric IPv4 literal, construct InetSocketAddress without blocking DNS query
-                    val endpoint = if (isIpv4Literal(host)) {
-                        val addr = InetAddress.getByAddress(parseIpv4Bytes(host))
-                        InetSocketAddress(addr, port)
-                    } else {
-                        InetSocketAddress(host, port)
-                    }
-
-                    socket.connect(endpoint, timeoutMs)
-                    if (continuation.isActive) {
-                        continuation.resume(PreFlightProbeResult.Reachable)
-                    }
-                } catch (e: SocketTimeoutException) {
-                    if (continuation.isActive) {
-                        continuation.resume(
-                            PreFlightProbeResult.Unreachable(
-                                host = host,
-                                port = port,
-                                message = "Connection timed out after ${timeoutMs}ms",
-                                actionableAdvice = "Host unreachable on port $port. Check host firewall (Windows Defender Public profile) or AP station isolation."
-                            )
-                        )
-                    }
-                } catch (e: NoRouteToHostException) {
-                    if (continuation.isActive) {
-                        continuation.resume(
-                            PreFlightProbeResult.Unreachable(
-                                host = host,
-                                port = port,
-                                message = "No route to host: ${e.message}",
-                                actionableAdvice = "Cannot route to $host. Verify Wi-Fi network association and subnet reachability."
-                            )
-                        )
-                    }
-                } catch (e: ConnectException) {
-                    if (continuation.isActive) {
-                        continuation.resume(
-                            PreFlightProbeResult.Unreachable(
-                                host = host,
-                                port = port,
-                                message = "Connection refused on port $port: ${e.message}",
-                                actionableAdvice = "Port $port connection refused. Verify the AndroGrid orchestrator daemon is running on $host."
-                            )
-                        )
-                    }
-                } catch (e: UnknownHostException) {
-                    if (continuation.isActive) {
-                        continuation.resume(
-                            PreFlightProbeResult.Unreachable(
-                                host = host,
-                                port = port,
-                                message = "Unknown host: ${e.message}",
-                                actionableAdvice = "Cannot resolve hostname '$host'. Use a direct IPv4 address or verify mDNS/DNS."
-                            )
-                        )
-                    }
-                } catch (e: SocketException) {
-                    if (continuation.isActive) {
-                        PreFlightProbeResult.Unreachable(
-                            host = host,
-                            port = port,
-                            message = "Socket error: ${e.message}",
-                            actionableAdvice = "Check network connectivity and interface routing."
-                        ).let { continuation.resume(it) }
-                    }
-                } catch (e: IOException) {
-                    if (continuation.isActive) {
-                        continuation.resume(
-                            PreFlightProbeResult.Unreachable(
-                                host = host,
-                                port = port,
-                                message = "Network I/O error: ${e.message}",
-                                actionableAdvice = "Failed to establish TCP socket to $host:$port. Check network permissions and firewall rules."
-                            )
-                        )
-                    }
-                } finally {
-                    try {
-                        if (!socket.isClosed) {
+                    continuation.invokeOnCancellation {
+                        try {
                             socket.close()
+                        } catch (_: Throwable) {}
+                    }
+
+                    try {
+                        // If host is numeric IPv4 literal, construct InetSocketAddress without blocking DNS query
+                        val endpoint = if (isIpv4Literal(host)) {
+                            val addr = InetAddress.getByAddress(parseIpv4Bytes(host))
+                            InetSocketAddress(addr, port)
+                        } else {
+                            InetSocketAddress(host, port)
                         }
-                    } catch (_: Throwable) {}
+
+                        socket.connect(endpoint, timeoutMs)
+                        if (continuation.isActive) {
+                            continuation.resume(PreFlightProbeResult.Reachable)
+                        }
+                    } catch (e: SocketTimeoutException) {
+                        if (continuation.isActive) {
+                            continuation.resume(
+                                PreFlightProbeResult.Unreachable(
+                                    host = host,
+                                    port = port,
+                                    message = "Connection timed out after ${timeoutMs}ms",
+                                    actionableAdvice = "Host unreachable on port $port. Check host firewall (Windows Defender Public profile) or AP station isolation."
+                                )
+                            )
+                        }
+                    } catch (e: NoRouteToHostException) {
+                        if (continuation.isActive) {
+                            continuation.resume(
+                                PreFlightProbeResult.Unreachable(
+                                    host = host,
+                                    port = port,
+                                    message = "No route to host: ${e.message}",
+                                    actionableAdvice = "Cannot route to $host. Verify Wi-Fi network association and subnet reachability."
+                                )
+                            )
+                        }
+                    } catch (e: ConnectException) {
+                        if (continuation.isActive) {
+                            continuation.resume(
+                                PreFlightProbeResult.Unreachable(
+                                    host = host,
+                                    port = port,
+                                    message = "Connection refused on port $port: ${e.message}",
+                                    actionableAdvice = "Port $port connection refused. Verify the AndroGrid orchestrator daemon is running on $host."
+                                )
+                            )
+                        }
+                    } catch (e: UnknownHostException) {
+                        if (continuation.isActive) {
+                            continuation.resume(
+                                PreFlightProbeResult.Unreachable(
+                                    host = host,
+                                    port = port,
+                                    message = "Unknown host: ${e.message}",
+                                    actionableAdvice = "Cannot resolve hostname '$host'. On API 28 / legacy Wi-Fi, use direct IPv4 address fallback or QR pairing."
+                                )
+                            )
+                        }
+                    } catch (e: SocketException) {
+                        if (continuation.isActive) {
+                            continuation.resume(
+                                PreFlightProbeResult.Unreachable(
+                                    host = host,
+                                    port = port,
+                                    message = "Socket error: ${e.message}",
+                                    actionableAdvice = "Check network connectivity and interface routing."
+                                )
+                            )
+                        }
+                    } catch (e: IOException) {
+                        if (continuation.isActive) {
+                            continuation.resume(
+                                PreFlightProbeResult.Unreachable(
+                                    host = host,
+                                    port = port,
+                                    message = "Network I/O error: ${e.message}",
+                                    actionableAdvice = "Failed to establish TCP socket to $host:$port. Check network permissions and firewall rules."
+                                )
+                            )
+                        }
+                    } finally {
+                        try {
+                            if (!socket.isClosed) {
+                                socket.close()
+                            }
+                        } catch (_: Throwable) {}
+                    }
                 }
             }
         }
+
+        return result ?: PreFlightProbeResult.Unreachable(
+            host = host,
+            port = port,
+            message = "Connection timed out after ${timeoutMs}ms",
+            actionableAdvice = "Host unreachable on port $port. Check host firewall (Windows Defender Public profile) or AP station isolation."
+        )
     }
 
     internal fun isIpv4Literal(text: String): Boolean {
