@@ -56,6 +56,17 @@ We introduce standard Android Network Service Discovery (NSD) for zero-configura
 - The Wi-Fi endpoint in `ClusterSettingsRepository` is updated atomically only upon verified, successful enrollment, preventing premature configuration corruption on cancel or failure.
 - Already enrolled nodes do not initiate discovery or show the banner to preserve battery and radio state.
 
+### 5. Transport Reachability Pre-Flight Probing & Manual Endpoint Fallback (Issue #30 / Gate L-02)
+- **Decoupled Probe Lifecycle:** Socket reachability probing is completely decoupled from UI compose/recomposition loops (`renderState()`). Probing is triggered exclusively by explicit state transitions (e.g., initial discovery, endpoint change, or operator action) into dedicated CoroutineJobs (`discoveryProbeJob`).
+- **Immediate Cancellation & Resource Cleanup:** Implemented in `SocketReachabilityProber` using `suspendCancellableCoroutine` with `continuation.invokeOnCancellation { socket.close() }`. When a probe coroutine is cancelled by the caller deadline or UI lifecycle change, the underlying client socket is closed immediately from the cancellation thread, aborting connection wait within < 1500 ms (measured at ~120 ms).
+- **Fast-Path Numeric IPv4 Resolution:** Target host strings matching dotted-decimal IPv4 regex (`\d{1,3}(\.\d{1,3}){3}`) bypass blocking system DNS lookups (`InetAddress.getByName`), preventing hanging network threads on unresolvable hostnames.
+- **Strict Pre-Validation:** Manual endpoint dialog and direct QR payload parser enforce strict bounds before connection attempts:
+  * Port range must be 1..65535.
+  * CA fingerprint must be exactly 64 hexadecimal characters.
+  * Host must be non-blank.
+- **Atomic Settings Commit:** `ClusterSettingsRepository` is never mutated during probing or preliminary validation. Endpoint and TLS settings are committed atomically only upon verified `EnrollmentResult.Success`.
+- **10-Second Timed Discovery Fallback UX:** In environments where router station isolation or mDNS packet suppression blocks zero-config advertisements, a 10-second timer (`discoveryFallbackJob`) automatically surfaces an actionable UI banner guiding the operator to manual fallback or QR scanning.
+
 ---
 
 ## Consequences

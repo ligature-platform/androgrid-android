@@ -307,6 +307,7 @@ class ArtifactResolverTest {
         val fixture = createMtlsTestFixture("localhost")
         val server = MockWebServer()
         server.useHttps(fixture.serverSocketFactory, false)
+        server.protocols = listOf(okhttp3.Protocol.HTTP_1_1)
         server.requireClientAuth()
         val payload = ByteArray(16 * 1024) { (it and 0xFF).toByte() }
         val sha = sha256Hex(payload)

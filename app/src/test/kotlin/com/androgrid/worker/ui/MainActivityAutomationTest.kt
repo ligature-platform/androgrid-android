@@ -113,6 +113,15 @@ class MainActivityAutomationTest {
         val activity = controller.get()
         activity.settingsRepository = repo
 
+        // Device is already provisioned with mTLS credentials
+        repo.updateSettings(
+            repo.getSettings().copy(
+                caCertPem = "dummy-ca",
+                clientCertPem = "dummy-client",
+                clientKeyPem = "dummy-key"
+            )
+        )
+
         controller.create().start().resume()
 
         activity.applyManualSettings("10.100.102.6", 50051, "", "")

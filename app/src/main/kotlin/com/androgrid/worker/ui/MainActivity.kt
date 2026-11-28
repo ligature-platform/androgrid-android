@@ -91,6 +91,12 @@ class MainActivity : ComponentActivity() {
     internal lateinit var manualEndpointButton: Button
     private lateinit var settingsButton: Button
 
+    private var discoveryProbeJob: kotlinx.coroutines.Job? = null
+    private var lastProbedEndpoint: String? = null
+    private var currentProbeAdvice: String? = null
+    private var discoveryFallbackJob: kotlinx.coroutines.Job? = null
+    private var discoveryFallbackTriggered = false
+
     private val qrScanLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -246,6 +252,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
+        discoveryProbeJob?.cancel()
+        discoveryFallbackJob?.cancel()
         participationController?.onUiStopped()
         viewModel.onUiStopped()
     }
@@ -511,19 +519,68 @@ class MainActivity : ComponentActivity() {
         val cluster = state.discoveredClusters.firstOrNull()
 
         if (cluster != null && isUnconfigured) {
+            discoveryFallbackJob?.cancel()
             discoveryCardView.visibility = View.VISIBLE
-            discoveryDetailsView.text = "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})"
-            discoveryDetailsView.setTextColor(Color.WHITE)
+            val endpoint = cluster.endpoint()
 
-            lifecycleScope.launch {
-                val probe = SocketReachabilityProber.probe(cluster.host, cluster.port, timeoutMs = 1500)
-                if (probe is PreFlightProbeResult.Unreachable) {
-                    discoveryDetailsView.text = "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})\n⚠️ Reachability Warning: ${probe.actionableAdvice}"
-                    discoveryDetailsView.setTextColor(Color.parseColor("#FFCC80"))
+            if (endpoint != lastProbedEndpoint) {
+                lastProbedEndpoint = endpoint
+                currentProbeAdvice = null
+                discoveryDetailsView.text = "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})"
+                discoveryDetailsView.setTextColor(Color.WHITE)
+
+                discoveryProbeJob?.cancel()
+                discoveryProbeJob = lifecycleScope.launch {
+                    val probe = SocketReachabilityProber.probe(cluster.host, cluster.port, timeoutMs = 2000)
+                    if (lastProbedEndpoint == endpoint) {
+                        if (probe is PreFlightProbeResult.Unreachable) {
+                            currentProbeAdvice = probe.actionableAdvice
+                            discoveryDetailsView.text = "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})\n⚠️ Reachability Warning: ${probe.actionableAdvice}"
+                            discoveryDetailsView.setTextColor(Color.parseColor("#FFCC80"))
+                        } else {
+                            currentProbeAdvice = null
+                            discoveryDetailsView.text = "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})"
+                            discoveryDetailsView.setTextColor(Color.WHITE)
+                        }
+                    }
+                }
+            } else if (currentProbeAdvice != null) {
+                discoveryDetailsView.text = "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})\n⚠️ Reachability Warning: $currentProbeAdvice"
+                discoveryDetailsView.setTextColor(Color.parseColor("#FFCC80"))
+            } else {
+                discoveryDetailsView.text = "Host: ${cluster.endpoint()} (Cluster: ${cluster.clusterName})"
+                discoveryDetailsView.setTextColor(Color.WHITE)
+            }
+        } else if (isUnconfigured) {
+            lastProbedEndpoint = null
+            currentProbeAdvice = null
+            discoveryProbeJob?.cancel()
+
+            // 10-second timed fallback: guide operator if discovery yields no clusters
+            if (discoveryFallbackTriggered) {
+                discoveryCardView.visibility = View.VISIBLE
+                discoveryDetailsView.text = "No cluster detected on local Wi-Fi.\nPlease tap 'Manual Endpoint Connect' or 'Scan Enrollment QR Code'."
+                discoveryDetailsView.setTextColor(Color.parseColor("#FFCC80"))
+            } else {
+                discoveryCardView.visibility = View.GONE
+                if (discoveryFallbackJob == null || discoveryFallbackJob?.isCompleted == true) {
+                    discoveryFallbackJob = lifecycleScope.launch {
+                        kotlinx.coroutines.delay(10000L)
+                        if (!state.isConfigured && state.discoveredClusters.isEmpty()) {
+                            discoveryFallbackTriggered = true
+                            discoveryCardView.visibility = View.VISIBLE
+                            discoveryDetailsView.text = "No cluster detected on local Wi-Fi.\nPlease tap 'Manual Endpoint Connect' or 'Scan Enrollment QR Code'."
+                            discoveryDetailsView.setTextColor(Color.parseColor("#FFCC80"))
+                        }
+                    }
                 }
             }
         } else {
             discoveryCardView.visibility = View.GONE
+            lastProbedEndpoint = null
+            currentProbeAdvice = null
+            discoveryProbeJob?.cancel()
+            discoveryFallbackJob?.cancel()
         }
     }
 
@@ -660,12 +717,17 @@ class MainActivity : ComponentActivity() {
             .setPositiveButton("Probe & Connect") { _, _ ->
                 val host = hostInput.text.toString().trim()
                 val portStr = portInput.text.toString().trim()
-                val port = portStr.toIntOrNull() ?: 50051
+                val port = portStr.toIntOrNull()
                 val token = tokenInput.text.toString().trim()
                 val ca = caInput.text.toString().trim()
 
                 if (host.isBlank()) {
                     Toast.makeText(this, "Host address cannot be empty", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+
+                if (port == null || port !in 1..65535) {
+                    Toast.makeText(this, "Port must be a valid number between 1 and 65535", Toast.LENGTH_SHORT).show()
                     return@setPositiveButton
                 }
 
@@ -679,9 +741,9 @@ class MainActivity : ComponentActivity() {
                                 "${probeResult.message}\n\n" +
                                 "Actionable Guidance:\n" +
                                 "${probeResult.actionableAdvice}\n\n" +
-                                "Do you want to save this endpoint anyway?"
+                                "Do you want to proceed with these manual settings anyway?"
                             )
-                            .setPositiveButton("Save Anyway") { _, _ ->
+                            .setPositiveButton("Proceed Anyway") { _, _ ->
                                 applyManualSettings(host, port, token, ca)
                             }
                             .setNegativeButton("Cancel", null)
@@ -701,25 +763,59 @@ class MainActivity : ComponentActivity() {
     }
 
     internal fun applyManualSettings(host: String, port: Int, token: String, caFingerprint: String) {
+        val trimmedHost = host.trim()
+        if (trimmedHost.isBlank()) {
+            Toast.makeText(this, "Host address cannot be empty", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (port !in 1..65535) {
+            Toast.makeText(this, "Port $port is outside valid range (1-65535)", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val trimmedToken = token.trim()
+        val trimmedCa = caFingerprint.trim().lowercase()
         val repo = settingsRepository ?: SharedPreferencesClusterSettingsRepository.getInstance(applicationContext)
         val current = repo.getSettings()
-        repo.updateSettings(current.copy(wifiHost = host, wifiPort = port))
 
-        if (token.isNotBlank() && caFingerprint.length == 64) {
-            val payload = EnrollmentPayload(
-                clusterEndpoint = "$host:$port",
-                caFingerprint = caFingerprint,
-                pairingToken = token,
-                nodeId = viewModel.uiState.value.nodeId,
-                directIp = host,
-                directPort = port
-            )
+        val hasToken = trimmedToken.isNotBlank()
+        val hasCa = trimmedCa.isNotBlank()
+
+        if (hasToken || hasCa) {
+            if (!hasToken) {
+                Toast.makeText(this, "Pairing token cannot be empty when enrolling", Toast.LENGTH_LONG).show()
+                return
+            }
+            val isHex = trimmedCa.length == 64 && trimmedCa.all { it in '0'..'9' || it in 'a'..'f' }
+            if (!isHex) {
+                Toast.makeText(this, "CA fingerprint must be a 64-character hexadecimal SHA-256 hash", Toast.LENGTH_LONG).show()
+                return
+            }
+
+            val payload = try {
+                EnrollmentPayload(
+                    clusterEndpoint = "$trimmedHost:$port",
+                    caFingerprint = trimmedCa,
+                    pairingToken = trimmedToken,
+                    nodeId = viewModel.uiState.value.nodeId,
+                    directIp = trimmedHost,
+                    directPort = port
+                )
+            } catch (e: Exception) {
+                Toast.makeText(this, "Invalid enrollment credentials: ${e.message}", Toast.LENGTH_LONG).show()
+                return
+            }
+
+            // Note: Settings are NOT mutated here. EnrollmentCoordinator commits settings only on confirmed EnrollmentResult.Success.
             executeEnrollmentPayload(payload)
         } else if (current.hasMtlsCredentials) {
-            Toast.makeText(this, "Endpoint updated to $host:$port. Starting compute...", Toast.LENGTH_SHORT).show()
+            // Updating existing endpoint for already-provisioned device
+            repo.updateSettings(current.copy(wifiHost = trimmedHost, wifiPort = port))
+            Toast.makeText(this, "Endpoint updated to $trimmedHost:$port. Starting compute...", Toast.LENGTH_SHORT).show()
             viewModel.startParticipation()
         } else {
-            Toast.makeText(this, "Endpoint updated to $host:$port. Please pair or provision mTLS credentials.", Toast.LENGTH_LONG).show()
+            // New unprovisioned worker without credentials: do not save or pretend to save
+            Toast.makeText(this, "Incomplete credentials: Enter pairing token and CA fingerprint to enroll a new worker.", Toast.LENGTH_LONG).show()
         }
     }
 
