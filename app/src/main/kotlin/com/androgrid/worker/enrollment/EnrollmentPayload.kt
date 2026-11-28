@@ -14,13 +14,17 @@ import java.net.URI
  * @property pairingToken Single-use cryptographic ephemeral token issued by CLI or operator.
  * @property nodeId Optional pre-assigned node identifier.
  * @property expiresAtEpochSeconds Optional token expiration timestamp in Unix epoch seconds.
+ * @property directIp Optional direct IPv4 address or hostname bypassing mDNS.
+ * @property directPort Optional direct TCP port (1..65535) bypassing mDNS.
  */
 data class EnrollmentPayload(
     val clusterEndpoint: String,
     val caFingerprint: String,
     val pairingToken: String,
     val nodeId: String? = null,
-    val expiresAtEpochSeconds: Long? = null
+    val expiresAtEpochSeconds: Long? = null,
+    val directIp: String? = null,
+    val directPort: Int? = null
 ) {
     init {
         require(clusterEndpoint.isNotBlank()) { "cluster_endpoint must not be blank" }
@@ -28,20 +32,29 @@ data class EnrollmentPayload(
         require(caFingerprint.length == 64 && caFingerprint.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
             "ca_fingerprint must be a valid 64-character hexadecimal SHA-256 hash"
         }
+        if (directPort != null) {
+            require(directPort in 1..65535) { "direct_port must be between 1 and 65535 (got $directPort)" }
+        }
+        if (directIp != null) {
+            require(directIp.isNotBlank()) { "direct_ip must not be blank when specified" }
+        }
     }
 
     /**
-     * Resolves host and port components from clusterEndpoint.
+     * Resolves host and port components, preferring directIp and directPort when present.
      *
      * @param defaultPort Default port if unspecified in endpoint string (defaults to 50051).
      * @return Pair containing the host string and integer port.
      */
     fun parseEndpoint(defaultPort: Int = 50051): Pair<String, Int> {
+        if (!directIp.isNullOrBlank() && directPort != null && directPort in 1..65535) {
+            return Pair(directIp, directPort)
+        }
         val trimmed = clusterEndpoint.trim()
         val colonIndex = trimmed.lastIndexOf(':')
         return if (colonIndex > 0 && colonIndex < trimmed.length - 1) {
             val host = trimmed.substring(0, colonIndex).removePrefix("[").removeSuffix("]")
-            val port = trimmed.substring(colonIndex + 1).toIntOrNull() ?: defaultPort
+            val port = trimmed.substring(colonIndex + 1).toIntOrNull()?.takeIf { it in 1..65535 } ?: defaultPort
             Pair(host, port)
         } else {
             Pair(trimmed, defaultPort)
@@ -71,6 +84,8 @@ data class EnrollmentPayload(
         obj.put("pairing_token", pairingToken)
         nodeId?.let { obj.put("node_id", it) }
         expiresAtEpochSeconds?.let { obj.put("expires_at_epoch_s", it) }
+        directIp?.let { obj.put("direct_ip", it) }
+        directPort?.let { obj.put("direct_port", it) }
         return obj.toString()
     }
 }
@@ -132,12 +147,30 @@ object EnrollmentPayloadParser {
                 obj.getLong("expires_at_epoch_seconds")
             } else null
 
+            val directIp = if (obj.has("direct_ip") && !obj.isNull("direct_ip")) {
+                val rawIp = obj.getString("direct_ip").trim()
+                require(rawIp.isNotEmpty()) { "direct_ip must not be blank when specified in JSON" }
+                rawIp
+            } else null
+
+            val directPort = if (obj.has("direct_port") && !obj.isNull("direct_port")) {
+                val rawPort = try {
+                    obj.getInt("direct_port")
+                } catch (e: Exception) {
+                    throw IllegalArgumentException("Invalid direct_port: must be an integer between 1 and 65535")
+                }
+                require(rawPort in 1..65535) { "direct_port must be between 1 and 65535 (got $rawPort)" }
+                rawPort
+            } else null
+
             return EnrollmentPayload(
                 clusterEndpoint = endpoint,
                 caFingerprint = ca,
                 pairingToken = token,
                 nodeId = nodeId,
-                expiresAtEpochSeconds = expires
+                expiresAtEpochSeconds = expires,
+                directIp = directIp,
+                directPort = directPort
             )
         } catch (e: JSONException) {
             throw IllegalArgumentException("Malformed JSON pairing payload: ${e.message}", e)
@@ -171,12 +204,28 @@ object EnrollmentPayloadParser {
             require(token.isNotBlank()) { "URI query must contain token" }
             require(ca.isNotBlank()) { "URI query must contain ca" }
 
+            val directIp = if (queryMap.containsKey("direct_ip")) {
+                val rawIp = queryMap["direct_ip"]?.trim()
+                require(!rawIp.isNullOrEmpty()) { "direct_ip must not be blank when specified in URI" }
+                rawIp
+            } else null
+
+            val directPort = if (queryMap.containsKey("direct_port")) {
+                val rawPortStr = queryMap["direct_port"]
+                val rawPort = rawPortStr?.toIntOrNull()
+                    ?: throw IllegalArgumentException("Invalid direct_port in URI: '$rawPortStr' is not a valid integer")
+                require(rawPort in 1..65535) { "direct_port in URI must be between 1 and 65535 (got $rawPort)" }
+                rawPort
+            } else null
+
             return EnrollmentPayload(
                 clusterEndpoint = endpoint,
                 caFingerprint = ca,
                 pairingToken = token,
                 nodeId = nodeId,
-                expiresAtEpochSeconds = expires
+                expiresAtEpochSeconds = expires,
+                directIp = directIp,
+                directPort = directPort
             )
         } catch (e: Exception) {
             if (e is IllegalArgumentException) throw e

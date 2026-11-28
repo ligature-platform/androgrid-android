@@ -101,6 +101,34 @@ class MainActivityAutomationTest {
         val scanButton = allViews.filterIsInstance<android.widget.Button>().find { it.text == "Scan Enrollment QR Code" }
         assertThat(scanButton).isNotNull()
 
+        val manualButton = allViews.filterIsInstance<android.widget.Button>().find { it.text == "Manual Endpoint Connect" }
+        assertThat(manualButton).isNotNull()
+
+        controller.destroy()
+    }
+
+    @Test
+    fun testMainActivity_applyManualSettings_updatesEndpoint() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java)
+        val activity = controller.get()
+        activity.settingsRepository = repo
+
+        // Device is already provisioned with mTLS credentials
+        repo.updateSettings(
+            repo.getSettings().copy(
+                caCertPem = "dummy-ca",
+                clientCertPem = "dummy-client",
+                clientKeyPem = "dummy-key"
+            )
+        )
+
+        controller.create().start().resume()
+
+        activity.applyManualSettings("10.100.102.6", 50051, "", "")
+        val settings = repo.getSettings()
+        assertThat(settings.wifiHost).isEqualTo("10.100.102.6")
+        assertThat(settings.wifiPort).isEqualTo(50051)
+
         controller.destroy()
     }
 
